@@ -104,7 +104,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     translation_prompt_file: str | None = None
     system_prompt: str | None = None
     text_key: str = "text"
-    source_lang_key: str = "source_lang"
+    source_lang_key: str | None = None
     target_lang_key: str = "target_lang"
     translations_key: str = "translations"
     skip_me_key: str = "_skip_me"
@@ -132,6 +132,13 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         if tp and tp > 0:
             self.resources = Resources(gpus=float(tp))
 
+        self._translation_prompt = self._resolve_translation_prompt()
+        self._prompt_placeholders = frozenset(
+            field_name
+            for _, field_name, _, _ in string.Formatter().parse(self._translation_prompt)
+            if field_name
+        )
+
     # ------------------------------------------------------------------
     # Prompt resolution
     # ------------------------------------------------------------------
@@ -152,13 +159,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def _init_model(self) -> None:
         if not VLLM_AVAILABLE:
             raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm")
-
-        self._translation_prompt = self._resolve_translation_prompt()
-        self._prompt_placeholders = frozenset(
-            field_name
-            for _, field_name, _, _ in string.Formatter().parse(self._translation_prompt)
-            if field_name
-        )
 
         from nemo_curator.utils.gpu_utils import get_gpu_count
 
@@ -226,7 +226,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.source_lang_key, self.target_lang_key, self.skip_me_key]
+        keys = [self.text_key, self.target_lang_key, self.skip_me_key]
+        if self.source_lang_key is not None:
+            keys.append(self.source_lang_key)
+        return [], keys
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.translations_key]
@@ -238,6 +241,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     def _build_prompt_values(self, data: dict) -> dict[str, str]:
         values: dict[str, str] = {}
         missing: list[str] = []
+
         for placeholder in self._prompt_placeholders:
             raw = data.get(placeholder, None)
             value = "" if raw is None else str(raw)
@@ -303,7 +307,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
             if self._n_inputs_logged < self.log_inputs:
                 self._n_inputs_logged += 1
-                logger.info("Input example {}: {}", self._n_inputs_logged, prompt)
+                logger.info("\nInput example {}: {}", self._n_inputs_logged, prompt)
 
         if prompts:
             outputs = self._llm.generate(
