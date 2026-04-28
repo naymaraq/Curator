@@ -23,7 +23,7 @@ accumulate across stage invocations.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import string
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,56 +46,56 @@ except ImportError:
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
 
 
+def lang_code_to_name(lang_code: str) -> str:
+    """Convert a language code (e.g. ``"en"``, ``"pt_BR"``, ``"eng"``) to a human-readable name.
+
+    Splits on ``"_"`` and uses the first part (so ``"pt_BR"`` -> ``"pt"``),
+    then resolves via ``pycountry`` (alpha-2, alpha-3, then generic lookup).
+    Falls back to the original code if ``pycountry`` is unavailable or no
+    match is found.
+    """
+    if not lang_code:
+        return lang_code
+
+    code = lang_code.split("_", 1)[0].strip()
+    if not code:
+        return lang_code
+
+    try:
+        import pycountry
+    except ImportError:
+        logger.warning("pycountry not installed; using raw language code '{}'", lang_code)
+        return lang_code
+
+    lookup_code = code.lower()
+    lang = None
+    if len(lookup_code) == 2:
+        lang = pycountry.languages.get(alpha_2=lookup_code)
+    elif len(lookup_code) == 3:
+        lang = pycountry.languages.get(alpha_3=lookup_code)
+
+    if lang is None:
+        try:
+            lang = pycountry.languages.lookup(code)
+        except LookupError:
+            logger.warning("Could not resolve language code '{}'", lang_code)
+            return lang_code
+    return getattr(lang, "name", lang_code)
+
+
 @dataclass
 class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
-    """Translate source text to a target language via batched LLM inference.
+    """Translate source text to a target language via batched vLLM inference.
 
-    Reads ``text_key`` (source text), ``source_lang_key`` and
-    ``target_lang_key`` (language tags, e.g. ``"en"``, ``"de"``) from
-    each ``AudioTask.data`` dict.  Writes the result into
-    ``data[translations_key]`` as a ``{target_lang: translation}``
-    mapping so the same source text can collect translations for
-    multiple languages across runs without overwriting prior entries.
+    Reads source text and ``source_lang`` / ``target_lang`` codes from each
+    ``AudioTask.data`` dict and writes the result into
+    ``data[translations_key]`` as a ``{target_lang: translation}`` mapping,
+    so multiple target languages accumulate without overwriting prior entries.
 
-    The stage ships with a default translation prompt template at
-    ``prompts/translation_prompt.md``.  Override with
-    ``translation_prompt`` (inline string) or
-    ``translation_prompt_file`` (path to a markdown file).  An
-    optional ``system_prompt`` can be supplied separately.
-
-    Uses ``process_batch`` for efficient batched GPU inference via
-    vLLM with prefix caching enabled (shared prompt prefixes are
-    cached across requests in the batch).
-
-    Args:
-        model_id: HuggingFace model identifier for the text LLM.
-        translation_prompt: Inline translation prompt template with
-            ``{text}``, ``{source_lang}`` and ``{target_lang}``
-            placeholders.  Takes precedence over
-            ``translation_prompt_file``.
-        translation_prompt_file: Path to a file containing the
-            translation prompt template.  Falls back to the bundled
-            default if neither ``translation_prompt`` nor
-            ``translation_prompt_file`` is set.
-        system_prompt: Optional system prompt for the LLM.
-        text_key: Input manifest key holding the source text.
-        source_lang_key: Input manifest key holding the source
-            language tag.
-        target_lang_key: Input manifest key holding the target
-            language tag.
-        translations_key: Output manifest key under which the
-            ``{target_lang: translation}`` dict is stored.
-        skip_me_key: Key used to flag entries to skip (consistent
-            with PnC / ITN stages).
-        tensor_parallel_size: GPUs for tensor parallelism (``None``
-            = auto-detect).
-        max_output_tokens: Maximum tokens to generate per sample.
-        max_model_len: Maximum context length passed to vLLM.
-        max_num_seqs: Maximum concurrent sequences in vLLM.
-        gpu_memory_utilization: Fraction of GPU memory vLLM may use.
-        kv_cache_dtype: KV-cache dtype (``fp8`` halves memory, 2x
-            concurrent sequences on Hopper).
-        temperature: Sampling temperature (0.0 = greedy).
+    The prompt template is loaded from ``prompts/translation_prompt.md`` by
+    default; override with ``translation_prompt`` (inline string) or
+    ``translation_prompt_file`` (path to a file). An optional
+    ``system_prompt`` is supported.
     """
 
     name: str = "LLMTranslation"
@@ -115,6 +115,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     gpu_memory_utilization: float = 0.95
     kv_cache_dtype: str = "fp8"
     temperature: float = 0.0
+    log_inputs: int = 5
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 64
 
@@ -122,7 +123,9 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     _tokenizer: Any = field(default=None, init=False, repr=False)
     _sampling_params: Any = field(default=None, init=False, repr=False)
     _translation_prompt: str = field(default="", init=False, repr=False)
+    _prompt_placeholders: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
     _n_processed: int = field(default=0, init=False, repr=False)
+    _n_inputs_logged: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         tp = self.tensor_parallel_size
@@ -151,6 +154,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm")
 
         self._translation_prompt = self._resolve_translation_prompt()
+        self._prompt_placeholders = frozenset(
+            field_name
+            for _, field_name, _, _ in string.Formatter().parse(self._translation_prompt)
+            if field_name
+        )
 
         from nemo_curator.utils.gpu_utils import get_gpu_count
 
@@ -227,8 +235,26 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Prompt formatting
     # ------------------------------------------------------------------
 
+    def _build_prompt_values(self, data: dict) -> dict[str, str]:
+        values: dict[str, str] = {}
+        missing: list[str] = []
+        for placeholder in self._prompt_placeholders:
+            raw = data.get(placeholder, None)
+            value = "" if raw is None else str(raw)
+            if placeholder in (self.source_lang_key, self.target_lang_key):
+                value = lang_code_to_name(value)
+            if not value.strip():
+                missing.append(placeholder)
+            values[placeholder] = value
+
+        if missing:
+            raise ValueError(f"Translation prompt placeholders not filled: {sorted(missing)}")
+        return values
+
     def _format_prompt(self, data: dict) -> str:
-        user_content = self._translation_prompt.format_map(defaultdict(str, data))
+        user_content = self._translation_prompt.format_map(
+            self._build_prompt_values(data)
+        )
         messages: list[dict[str, str]] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
@@ -260,15 +286,24 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
         for i, task in enumerate(tasks):
             data = task.data
-            if data.get(self.skip_me_key, ""):
+
+            # Skip tasks marked with `skip_me_key`
+            skip_me = data.get(self.skip_me_key, "")
+            if skip_me:
                 continue
+
+            # Skip tasks with empty text
             text = data.get(self.text_key, "")
-            source_lang = data.get(self.source_lang_key, "")
-            target_lang = data.get(self.target_lang_key, "")
-            if not text or not text.strip() or not source_lang or not target_lang:
+            if not text or not text.strip():
                 continue
+
+            prompt = self._format_prompt(dict(data))
             valid_indices.append(i)
-            prompts.append(self._format_prompt(dict(data)))
+            prompts.append(prompt)
+
+            if self._n_inputs_logged < self.log_inputs:
+                self._n_inputs_logged += 1
+                logger.info("Input example {}: {}", self._n_inputs_logged, prompt)
 
         if prompts:
             outputs = self._llm.generate(
