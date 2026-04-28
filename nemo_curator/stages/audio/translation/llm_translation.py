@@ -238,15 +238,18 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Prompt formatting
     # ------------------------------------------------------------------
 
-    def _build_prompt_values(self, data: dict) -> dict[str, str]:
+    def _build_prompt_values(self, data: dict, target_lang: str) -> dict[str, str]:
         values: dict[str, str] = {}
         missing: list[str] = []
 
         for placeholder in self._prompt_placeholders:
-            raw = data.get(placeholder, None)
-            value = "" if raw is None else str(raw)
-            if placeholder in (self.source_lang_key, self.target_lang_key):
-                value = lang_code_to_name(value)
+            if placeholder == self.target_lang_key:
+                value = lang_code_to_name(target_lang)
+            else:
+                raw = data.get(placeholder, None)
+                value = "" if raw is None else str(raw)
+                if placeholder == self.source_lang_key:
+                    value = lang_code_to_name(value)
             if not value.strip():
                 missing.append(placeholder)
             values[placeholder] = value
@@ -255,9 +258,9 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(f"Translation prompt placeholders not filled: {sorted(missing)}")
         return values
 
-    def _format_prompt(self, data: dict) -> str:
+    def _format_prompt(self, data: dict, target_lang: str) -> str:
         user_content = self._translation_prompt.format_map(
-            self._build_prompt_values(data)
+            self._build_prompt_values(data, target_lang)
         )
         messages: list[dict[str, str]] = []
         if self.system_prompt:
@@ -285,10 +288,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             msg = "Model not initialised — setup() was not called"
             raise RuntimeError(msg)
 
-        valid_indices: list[int] = []
         prompts: list[str] = []
+        prompt_owners: list[tuple[int, str]] = []
 
-        for i, task in enumerate(tasks):
+        for task_idx, task in enumerate(tasks):
             data = task.data
 
             # Skip tasks marked with `skip_me_key`
@@ -301,13 +304,24 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             if not text or not text.strip():
                 continue
 
-            prompt = self._format_prompt(dict(data))
-            valid_indices.append(i)
-            prompts.append(prompt)
+            # Normalize target language(s): accept str or list[str].
+            raw_targets = data.get(self.target_lang_key) or []
+            if isinstance(raw_targets, str):
+                raw_targets = [raw_targets]
+            targets = list(dict.fromkeys(raw_targets)) # Remove duplicates
 
-            if self._n_inputs_logged < self.log_inputs:
-                self._n_inputs_logged += 1
-                logger.info("\nInput example {}: {}", self._n_inputs_logged, prompt)
+            # Skip tasks with no targets
+            if not targets:
+                continue
+
+            for target_lang in targets:
+                prompt = self._format_prompt(data, target_lang)
+                prompts.append(prompt)
+                prompt_owners.append((task_idx, target_lang))
+
+                if self._n_inputs_logged < self.log_inputs:
+                    self._n_inputs_logged += 1
+                    logger.info("\nInput example {}: {}", self._n_inputs_logged, prompt)
 
         if prompts:
             outputs = self._llm.generate(
@@ -316,9 +330,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 use_tqdm=False,
             )
 
-            for seq_idx, task_idx in enumerate(valid_indices):
+            for seq_idx, (task_idx, target_lang) in enumerate(prompt_owners):
                 task = tasks[task_idx]
-                target_lang = task.data[self.target_lang_key]
                 translation = outputs[seq_idx].outputs[0].text.strip()
 
                 translations = task.data.get(self.translations_key) or {}
@@ -326,5 +339,5 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 task.data[self.translations_key] = translations
                 self._n_processed += 1
 
-        logger.debug("LLMTranslation: batch of {} tasks ({} translated)", len(tasks), len(prompts))
+        logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
