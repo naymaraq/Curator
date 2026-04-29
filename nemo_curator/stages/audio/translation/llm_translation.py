@@ -33,6 +33,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
+from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -43,6 +44,12 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
+try:
+    import pycountry
+    PYCOUNTRY_AVAILABLE = True
+except ImportError:
+    PYCOUNTRY_AVAILABLE = False
+
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
 
 
@@ -50,9 +57,10 @@ def lang_code_to_name(lang_code: str) -> str:
     """Convert a language code (e.g. ``"en"``, ``"pt_BR"``, ``"eng"``) to a human-readable name.
 
     Splits on ``"_"`` and uses the first part (so ``"pt_BR"`` -> ``"pt"``),
-    then resolves via ``pycountry`` (alpha-2, alpha-3, then generic lookup).
-    Falls back to the original code if ``pycountry`` is unavailable or no
-    match is found.
+    then consults the curated ``LANGUAGE_MAP`` first. Only when the code is
+    not present there does it fall back to ``pycountry`` (alpha-2, alpha-3,
+    then generic lookup). Falls back to the original code if ``pycountry``
+    is unavailable or no match is found.
     """
     if not lang_code:
         return lang_code
@@ -61,13 +69,18 @@ def lang_code_to_name(lang_code: str) -> str:
     if not code:
         return lang_code
 
-    try:
-        import pycountry
-    except ImportError:
+    lookup_code = code.lower()
+    if lookup_code in LANGUAGE_MAP:
+        return LANGUAGE_MAP[lookup_code]
+
+    if not PYCOUNTRY_AVAILABLE:
         logger.warning("pycountry not installed; using raw language code '{}'", lang_code)
         return lang_code
+    
+    # Fallback to pycountry
+    # If the code is not a valid language code, return the original code
+    # If the code is a valid language code, return the language name
 
-    lookup_code = code.lower()
     lang = None
     if len(lookup_code) == 2:
         lang = pycountry.languages.get(alpha_2=lookup_code)
