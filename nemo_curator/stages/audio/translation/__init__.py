@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_curator.stages.audio.translation.language_resolver import LanguageResolverStage
 from nemo_curator.stages.audio.translation.llm_translation import LLMTranslationStage
 
-__all__ = ["LLMTranslationStage"]
+__all__ = ["LLMTranslationStage", "LanguageResolverStage"]

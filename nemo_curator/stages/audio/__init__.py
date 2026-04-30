@@ -47,7 +47,7 @@ from nemo_curator.stages.audio.segmentation import (
     SpeakerSeparationStage,
     VADSegmentationStage,
 )
-from nemo_curator.stages.audio.translation import LLMTranslationStage
+from nemo_curator.stages.audio.translation import LanguageResolverStage, LLMTranslationStage
 
 __all__ = [
     "ALMDataBuilderStage",
@@ -56,6 +56,7 @@ __all__ = [
     "BandFilterStage",
     "GetAudioDurationStage",
     "LLMTranslationStage",
+    "LanguageResolverStage",
     "ManifestReader",
     "ManifestWriterStage",
     "MonoConversionStage",

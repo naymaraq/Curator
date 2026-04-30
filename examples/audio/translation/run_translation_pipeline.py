@@ -14,14 +14,19 @@
 
 """LLM-based translation pipeline.
 
-Runs ``LLMTranslationStage`` on a JSONL manifest whose entries already
-carry per-row ``text``, ``source_lang`` and ``target_lang`` fields.
+Reads a JSONL manifest of ``text`` + ``source_lang`` (code) entries and
+produces ``data["translations"]`` keyed by target language display name.
+Direction is restricted to ``En->X`` and ``X->En``, where ``X`` ranges
+over the codes passed via ``--target_langs``.
 
 Architecture:
     ManifestReader (CPU)
         -> reads JSONL manifest(s), emits one AudioTask per line
+    LanguageResolverStage (CPU)
+        -> resolves source_lang code -> source_lang_name (display name)
+           and writes per-row translate_to list (En->X / X->En only)
     LLMTranslationStage (GPU)
-        -> batched vLLM inference, writes data["translations"][target_lang]
+        -> batched vLLM inference, writes data["translations"][lang_name]
     ManifestWriterStage (CPU)
         -> appends each translated entry to a single JSONL output
 """
@@ -39,6 +44,7 @@ from loguru import logger
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio import (
+    LanguageResolverStage,
     LLMTranslationStage,
     ManifestReader,
     ManifestWriterStage,
@@ -54,9 +60,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Input JSONL manifest path (file or directory). Multiple paths can be passed space-separated.",
         nargs="+",
     )
-    ap.add_argument("--output_manifest", type=str, required=True, help="Output JSONL manifest path.")
-
-    ap.add_argument("--model_id", type=str, default="Qwen/Qwen3.5-35B-A3B-FP8", help="Translation LLM model id.")
+    ap.add_argument(
+        "--output_manifest", 
+        type=str, 
+        required=True, 
+        help="Output JSONL manifest path."
+    )
+    ap.add_argument(
+        "--model_id", 
+        type=str, 
+        default="Qwen/Qwen3.5-35B-A3B-FP8", 
+        help="Translation LLM model id."
+    )
     ap.add_argument(
         "--prompt_file",
         type=str,
@@ -70,12 +85,49 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optional system prompt. Inline string or path to a file.",
     )
 
-    ap.add_argument("--text_key", type=str, default="text", help="Manifest key holding the source text.")
     ap.add_argument(
-        "--source_lang_key", type=str, default="source_lang", help="Manifest key holding the source language tag."
+        "--text_key", 
+        type=str, 
+        default="text", 
+        help="Manifest key holding the source text."
     )
     ap.add_argument(
-        "--target_lang_key", type=str, default="target_lang", help="Manifest key holding the target language tag."
+        "--target_langs",
+        type=str,
+        nargs="+",
+        required=True,
+        help=(
+            "Target language codes (e.g. 'en sv fr'). LanguageResolverStage resolves them "
+            "to display names and writes per-row translate_to lists, restricted to En->X "
+            "and X->En pairs."
+        ),
+    )
+    ap.add_argument(
+        "--source_lang_code_key",
+        type=str,
+        default="source_lang",
+        help=(
+            "Input manifest key holding the source language CODE. The resolver reads this "
+            "and writes the resolved display name to --source_lang_key."
+        ),
+    )
+    ap.add_argument(
+        "--source_lang_key",
+        type=str,
+        default="source_lang_name",
+        help=(
+            "Manifest key holding the source language DISPLAY NAME (resolver output, "
+            "translator input)."
+        ),
+    )
+    ap.add_argument(
+        "--target_lang_key",
+        type=str,
+        default="translate_to",
+        help=(
+            "Manifest key holding the per-row list of target language display names "
+            "(resolver output, translator input)."
+        ),
     )
     ap.add_argument(
         "--translations_key",
@@ -121,6 +173,12 @@ def main() -> None:
 
     stages = [
         ManifestReader(manifest_path=manifest_path),
+        LanguageResolverStage(
+            target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
+            source_lang_name_key=args.source_lang_key,
+            translate_to_key=args.target_lang_key,
+        ),
         LLMTranslationStage(
             model_id=args.model_id,
             translation_prompt_file=args.prompt_file,

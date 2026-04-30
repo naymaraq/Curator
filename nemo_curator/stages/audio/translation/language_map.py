@@ -12,13 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Curated language code -> human-readable name mapping.
-
-Consulted before falling back to ``pycountry`` for translation prompt
-language resolution. Keys are lowercase ISO 639-1 alpha-2 codes.
-"""
-
-
 LANGUAGE_MAP: dict[str, str] = {
     "en": "English",
     "nl": "Dutch",

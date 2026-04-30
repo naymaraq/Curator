@@ -12,14 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LLM-based translation stage using vLLM.
-
-Reads source-language text plus per-task ``source_lang`` and
-``target_lang`` tags from each ``AudioTask``, runs a text LLM
-(Qwen3.5 by default), and stores the translation under
-``data["translations"][target_lang]`` so multiple target languages
-accumulate across stage invocations.
-"""
 
 from __future__ import annotations
 
@@ -33,7 +25,6 @@ from loguru import logger
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
-from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -44,69 +35,24 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-try:
-    import pycountry
-    PYCOUNTRY_AVAILABLE = True
-except ImportError:
-    PYCOUNTRY_AVAILABLE = False
-
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
-
-
-def lang_code_to_name(lang_code: str) -> str:
-    """Convert a language code (e.g. ``"en"``, ``"pt_BR"``, ``"eng"``) to a human-readable name.
-
-    Splits on ``"_"`` and uses the first part (so ``"pt_BR"`` -> ``"pt"``),
-    then consults the curated ``LANGUAGE_MAP`` first. Only when the code is
-    not present there does it fall back to ``pycountry`` (alpha-2, alpha-3,
-    then generic lookup). Falls back to the original code if ``pycountry``
-    is unavailable or no match is found.
-    """
-    if not lang_code:
-        return lang_code
-
-    code = lang_code.split("_", 1)[0].strip()
-    if not code:
-        return lang_code
-
-    lookup_code = code.lower()
-    if lookup_code in LANGUAGE_MAP:
-        return LANGUAGE_MAP[lookup_code]
-
-    if not PYCOUNTRY_AVAILABLE:
-        logger.warning("pycountry not installed; using raw language code '{}'", lang_code)
-        return lang_code
-    
-    # Fallback to pycountry
-    # If the code is not a valid language code, return the original code
-    # If the code is a valid language code, return the language name
-
-    lang = None
-    if len(lookup_code) == 2:
-        lang = pycountry.languages.get(alpha_2=lookup_code)
-    elif len(lookup_code) == 3:
-        lang = pycountry.languages.get(alpha_3=lookup_code)
-
-    if lang is None:
-        try:
-            lang = pycountry.languages.lookup(code)
-        except LookupError:
-            logger.warning("Could not resolve language code '{}'", lang_code)
-            return lang_code
-    return getattr(lang, "name", lang_code)
 
 
 @dataclass
 class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     """Translate source text to a target language via batched vLLM inference.
 
-    Reads source text and ``source_lang`` / ``target_lang`` codes from each
-    ``AudioTask.data`` dict and writes the result into
-    ``data[translations_key]`` as a ``{target_lang: translation}`` mapping,
-    so multiple target languages accumulate without overwriting prior entries.
+    Reads source text plus pre-resolved language **display names** from each
+    ``AudioTask.data`` dict (``source_lang_key`` and ``target_lang_key``;
+    populated upstream by ``LanguageResolverStage``) and writes the result
+    into ``data[translations_key]`` as a ``{display_name: translation}``
+    mapping, so multiple target languages accumulate without overwriting
+    prior entries.
 
-    The prompt template is loaded from ``prompts/translation_prompt.md`` by
-    default; override with ``translation_prompt`` (inline string) or
+    The prompt template uses fixed semantic placeholders ``{target_lang}``,
+    ``{source_lang}``, ``{text}`` regardless of the actual manifest key
+    names. Loaded from ``prompts/translation_prompt.md`` by default;
+    override with ``translation_prompt`` (inline string) or
     ``translation_prompt_file`` (path to a file). An optional
     ``system_prompt`` is supported.
     """
@@ -117,8 +63,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     translation_prompt_file: str | None = None
     system_prompt: str | None = None
     text_key: str = "text"
-    source_lang_key: str | None = None
-    target_lang_key: str = "target_lang"
+    source_lang_key: str | None = "source_lang_name"
+    target_lang_key: str = "translate_to"
     translations_key: str = "translations"
     skip_me_key: str = "_skip_me"
     tensor_parallel_size: int | None = None
@@ -252,17 +198,22 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def _build_prompt_values(self, data: dict, target_lang: str) -> dict[str, str]:
+        # Fixed semantic placeholders. The prompt template uses stable names
+        # ({target_lang}, {source_lang}) regardless of which manifest fields
+        # they're sourced from — manifest keys can be renamed without
+        # touching prompts. Other placeholders are looked up directly in data.
+        semantic: dict[str, str] = {"target_lang": target_lang}
+        if self.source_lang_key:
+            semantic["source_lang"] = str(data.get(self.source_lang_key) or "")
+
         values: dict[str, str] = {}
         missing: list[str] = []
-
         for placeholder in self._prompt_placeholders:
-            if placeholder == self.target_lang_key:
-                value = lang_code_to_name(target_lang)
+            if placeholder in semantic:
+                value = semantic[placeholder]
             else:
                 raw = data.get(placeholder, None)
                 value = "" if raw is None else str(raw)
-                if placeholder == self.source_lang_key:
-                    value = lang_code_to_name(value)
             if not value.strip():
                 missing.append(placeholder)
             values[placeholder] = value
