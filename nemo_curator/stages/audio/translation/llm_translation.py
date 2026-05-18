@@ -327,5 +327,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 task.data[self.translations_key] = translations
                 self._n_processed += 1
 
+        # Now that the translations are stored under `translations`, 
+        # remove it so it doesn't appear in the final output manifest.
+        for task in tasks:
+            task.data.pop(self.target_lang_key, None)
+
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
