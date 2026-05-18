@@ -149,7 +149,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max_num_seqs", type=int, default=16)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
     ap.add_argument("--kv_cache_dtype", type=str, default="fp8", help="KV-cache dtype passed to vLLM.")
-    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top_p", type=float, default=0.8)
+    ap.add_argument("--top_k", type=int, default=20)
+    ap.add_argument("--min_p", type=float, default=0.0)
+    ap.add_argument("--presence_penalty", type=float, default=1.5)
+    ap.add_argument("--repetition_penalty", type=float, default=1.0)
 
     ap.add_argument(
         "--execution_mode",
@@ -190,6 +195,11 @@ def main() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_dtype=args.kv_cache_dtype,
             temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            presence_penalty=args.presence_penalty,
+            repetition_penalty=args.repetition_penalty,
             batch_size=args.batch_size,
         ),
         ManifestWriterStage(output_path=args.output_manifest),

@@ -75,7 +75,12 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     max_num_seqs: int = 16
     gpu_memory_utilization: float = 0.95
     kv_cache_dtype: str = "fp8"
-    temperature: float = 0.0
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
     log_inputs: int = 5
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 64
@@ -174,6 +179,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         self._tokenizer = self._llm.get_tokenizer()
         self._sampling_params = SamplingParams(
             temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            presence_penalty=self.presence_penalty,
+            repetition_penalty=self.repetition_penalty,
             max_tokens=self.max_output_tokens,
         )
 
