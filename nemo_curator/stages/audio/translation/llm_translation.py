@@ -48,14 +48,21 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     populated upstream by ``LanguageResolverStage``) and writes the result
     into ``data[translations_key]`` as a ``{display_name: translation}``
     mapping, so multiple target languages accumulate without overwriting
-    prior entries.
+    prior entries. The scratch fields ``source_lang_key`` and
+    ``target_lang_key`` are removed from each row after the prompts are
+    built, so they don't bleed into the output manifest.
 
     The prompt template uses fixed semantic placeholders ``{target_lang}``,
     ``{source_lang}``, ``{text}`` regardless of the actual manifest key
-    names. Loaded from ``prompts/translation_prompt.md`` by default;
-    override with ``translation_prompt`` (inline string) or
-    ``translation_prompt_file`` (path to a file). An optional
-    ``system_prompt`` is supported.
+    names. ``{source_lang}`` is always populated from ``source_lang_key``,
+    which is mandatory and assumed pre-resolved by ``LanguageResolverStage``.
+
+    Both the translation prompt and the system prompt have bundled defaults
+    in ``prompts/`` (``translation_prompt.md`` and ``system_prompt.md``).
+    Override either via the inline-string fields (``translation_prompt``,
+    ``system_prompt``) or the ``*_file`` fields (``translation_prompt_file``,
+    ``system_prompt_file``); passing both inline and file for the same
+    prompt raises.
     """
 
     name: str = "LLMTranslation"
@@ -232,14 +239,13 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Prompt formatting
     # ------------------------------------------------------------------
 
-    def _build_prompt_values(self, data: dict, target_lang: str) -> dict[str, str]:
-        # Fixed semantic placeholders. The prompt template uses stable names
-        # ({target_lang}, {source_lang}) regardless of which manifest fields
-        # they're sourced from — manifest keys can be renamed without
-        # touching prompts. Other placeholders are looked up directly in data.
+    def _build_prompt_values(
+        self, data: dict, target_lang: str, source_lang: str
+    ) -> dict[str, str]:
+
         semantic: dict[str, str] = {
             "target_lang": target_lang,
-            "source_lang": str(data.get(self.source_lang_key) or ""),
+            "source_lang": source_lang,
         }
 
         values: dict[str, str] = {}
@@ -258,9 +264,11 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(f"Translation prompt placeholders not filled: {sorted(missing)}")
         return values
 
-    def _format_prompt(self, data: dict, target_lang: str) -> str:
+    def _format_prompt(
+        self, data: dict, target_lang: str, source_lang: str
+    ) -> str:
         user_content = self._translation_prompt.format_map(
-            self._build_prompt_values(data, target_lang)
+            self._build_prompt_values(data, target_lang, source_lang)
         )
         messages: list[dict[str, str]] = []
         if self._system_prompt:
@@ -294,6 +302,12 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         for task_idx, task in enumerate(tasks):
             data = task.data
 
+            # Pop scratch fields written by LanguageResolverStage up-front so
+            # they never reach the output manifest, regardless of which skip
+            # branch (if any) the task hits below.
+            raw_targets = data.pop(self.target_lang_key, None) or []
+            source_lang = data.pop(self.source_lang_key, "")
+
             # Skip tasks marked with `skip_me_key`
             skip_me = data.get(self.skip_me_key, "")
             if skip_me:
@@ -305,7 +319,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 continue
 
             # Normalize target language(s): accept str or list[str].
-            raw_targets = data.get(self.target_lang_key) or []
             if isinstance(raw_targets, str):
                 raw_targets = [raw_targets]
             targets = list(dict.fromkeys(raw_targets)) # Remove duplicates
@@ -315,7 +328,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 continue
 
             for target_lang in targets:
-                prompt = self._format_prompt(data, target_lang)
+                prompt = self._format_prompt(data, target_lang, source_lang)
                 prompts.append(prompt)
                 prompt_owners.append((task_idx, target_lang))
 
@@ -334,15 +347,15 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
                 task = tasks[task_idx]
                 translation = outputs[seq_idx].outputs[0].text.strip()
 
+                if not translation:
+                    logger.warning(
+                        "LLMTranslation: empty translation for target={}", target_lang,
+                    )
+
                 translations = task.data.get(self.translations_key) or {}
                 translations[target_lang] = translation
                 task.data[self.translations_key] = translations
                 self._n_processed += 1
-
-        # Now that the translations are stored under `translations`, 
-        # remove it so it doesn't appear in the final output manifest.
-        for task in tasks:
-            task.data.pop(self.target_lang_key, None)
 
         logger.debug("LLMTranslation: batch of {} tasks ({} translations)", len(tasks), len(prompts))
         return tasks
