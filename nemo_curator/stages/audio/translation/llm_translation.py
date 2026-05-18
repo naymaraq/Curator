@@ -81,6 +81,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     min_p: float = 0.0
     presence_penalty: float = 1.5
     repetition_penalty: float = 1.0
+    seed: int = 1234
     log_inputs: int = 5
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 64
@@ -174,7 +175,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             prefix_caching_hash_algo="xxhash",
             kv_cache_dtype=self.kv_cache_dtype,
             enforce_eager=False,
-            seed=1234,
+            seed=self.seed,
         )
         self._tokenizer = self._llm.get_tokenizer()
         self._sampling_params = SamplingParams(
@@ -185,6 +186,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             presence_penalty=self.presence_penalty,
             repetition_penalty=self.repetition_penalty,
             max_tokens=self.max_output_tokens,
+            seed=self.seed,
         )
 
         logger.info(

@@ -155,6 +155,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min_p", type=float, default=0.0)
     ap.add_argument("--presence_penalty", type=float, default=1.5)
     ap.add_argument("--repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=1234, help="Seed for vLLM and sampling params.")
 
     ap.add_argument(
         "--execution_mode",
@@ -200,6 +201,7 @@ def main() -> None:
             min_p=args.min_p,
             presence_penalty=args.presence_penalty,
             repetition_penalty=args.repetition_penalty,
+            seed=args.seed,
             batch_size=args.batch_size,
         ),
         ManifestWriterStage(output_path=args.output_manifest),
