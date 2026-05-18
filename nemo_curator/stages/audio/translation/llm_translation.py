@@ -36,6 +36,7 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 _DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "translation_prompt.md"
+_DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.md"
 
 
 @dataclass
@@ -62,8 +63,9 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     translation_prompt: str | None = None
     translation_prompt_file: str | None = None
     system_prompt: str | None = None
+    system_prompt_file: str | None = None
     text_key: str = "text"
-    source_lang_key: str | None = "source_lang_name"
+    source_lang_key: str = "source_lang_name"
     target_lang_key: str = "translate_to"
     translations_key: str = "translations"
     skip_me_key: str = "_skip_me"
@@ -82,6 +84,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     _tokenizer: Any = field(default=None, init=False, repr=False)
     _sampling_params: Any = field(default=None, init=False, repr=False)
     _translation_prompt: str = field(default="", init=False, repr=False)
+    _system_prompt: str | None = field(default=None, init=False, repr=False)
     _prompt_placeholders: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
     _n_processed: int = field(default=0, init=False, repr=False)
     _n_inputs_logged: int = field(default=0, init=False, repr=False)
@@ -91,7 +94,18 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         if tp and tp > 0:
             self.resources = Resources(gpus=float(tp))
 
-        self._translation_prompt = self._resolve_translation_prompt()
+        self._translation_prompt = self._resolve_prompt(
+            inline=self.translation_prompt,
+            file_path=self.translation_prompt_file,
+            default_path=_DEFAULT_PROMPT_PATH,
+            label="translation",
+        )
+        self._system_prompt = self._resolve_prompt(
+            inline=self.system_prompt,
+            file_path=self.system_prompt_file,
+            default_path=_DEFAULT_SYSTEM_PROMPT_PATH,
+            label="system",
+        )
         self._prompt_placeholders = frozenset(
             field_name
             for _, field_name, _, _ in string.Formatter().parse(self._translation_prompt)
@@ -102,13 +116,25 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # Prompt resolution
     # ------------------------------------------------------------------
 
-    def _resolve_translation_prompt(self) -> str:
-        if self.translation_prompt:
-            return self.translation_prompt
-        path = Path(self.translation_prompt_file) if self.translation_prompt_file else _DEFAULT_PROMPT_PATH
-        logger.info("LLMTranslation: loading prompt from {}", path)
+    @staticmethod
+    def _resolve_prompt(
+        inline: str | None,
+        file_path: str | None,
+        default_path: Path | None,
+        label: str,
+    ) -> str | None:
+        if inline and file_path:
+            raise ValueError(
+                f"LLMTranslation: pass either {label}_prompt or {label}_prompt_file, not both."
+            )
+        if inline:
+            return inline
+        path = Path(file_path) if file_path else default_path
+        if path is None:
+            return None
+        logger.info("LLMTranslation: loading {} prompt from {}", label, path)
         if not path.exists():
-            raise FileNotFoundError(f"Translation prompt file not found: {path}")
+            raise FileNotFoundError(f"{label.capitalize()} prompt file not found: {path}")
         return path.read_text(encoding="utf-8").strip()
 
     # ------------------------------------------------------------------
@@ -185,10 +211,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        keys = [self.text_key, self.target_lang_key, self.skip_me_key]
-        if self.source_lang_key is not None:
-            keys.append(self.source_lang_key)
-        return [], keys
+        return [], [self.text_key, self.target_lang_key, self.skip_me_key, self.source_lang_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.translations_key]
@@ -202,9 +225,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         # ({target_lang}, {source_lang}) regardless of which manifest fields
         # they're sourced from — manifest keys can be renamed without
         # touching prompts. Other placeholders are looked up directly in data.
-        semantic: dict[str, str] = {"target_lang": target_lang}
-        if self.source_lang_key:
-            semantic["source_lang"] = str(data.get(self.source_lang_key) or "")
+        semantic: dict[str, str] = {
+            "target_lang": target_lang,
+            "source_lang": str(data.get(self.source_lang_key) or ""),
+        }
 
         values: dict[str, str] = {}
         missing: list[str] = []
@@ -227,8 +251,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             self._build_prompt_values(data, target_lang)
         )
         messages: list[dict[str, str]] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+        if self._system_prompt:
+            messages.append({"role": "system", "content": self._system_prompt})
         messages.append({"role": "user", "content": user_content})
         return self._tokenizer.apply_chat_template(
             messages,

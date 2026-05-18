@@ -82,7 +82,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--system_prompt",
         type=str,
         default=None,
-        help="Optional system prompt. Inline string or path to a file.",
+        help="Optional inline system prompt string. Mutually exclusive with --system_prompt_file.",
+    )
+    ap.add_argument(
+        "--system_prompt_file",
+        type=str,
+        default=None,
+        help="Optional path to a system prompt file. Mutually exclusive with --system_prompt.",
     )
 
     ap.add_argument(
@@ -155,19 +161,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def _resolve_system_prompt(value: str | None) -> str | None:
-    if not value:
-        return None
-    if os.path.isfile(value):
-        with open(value, encoding="utf-8") as f:
-            return f.read().strip()
-    return value
-
-
 def main() -> None:
     args = _build_arg_parser().parse_args()
-
-    system_prompt = _resolve_system_prompt(args.system_prompt)
 
     manifest_path: str | list[str] = args.manifest if len(args.manifest) > 1 else args.manifest[0]
 
@@ -182,7 +177,8 @@ def main() -> None:
         LLMTranslationStage(
             model_id=args.model_id,
             translation_prompt_file=args.prompt_file,
-            system_prompt=system_prompt,
+            system_prompt=args.system_prompt,
+            system_prompt_file=args.system_prompt_file,
             text_key=args.text_key,
             source_lang_key=args.source_lang_key,
             target_lang_key=args.target_lang_key,
