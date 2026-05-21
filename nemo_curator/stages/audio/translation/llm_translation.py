@@ -75,7 +75,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     source_lang_key: str = "source_lang_name"
     target_lang_key: str = "translate_to"
     translations_key: str = "translations"
-    skip_me_key: str = "_skip_me"
     tensor_parallel_size: int | None = None
     max_output_tokens: int = 1024
     max_model_len: int = 4096
@@ -232,7 +231,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.target_lang_key, self.skip_me_key, self.source_lang_key]
+        return [], [self.text_key, self.target_lang_key, self.source_lang_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.translations_key]
@@ -309,11 +308,6 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             # branch (if any) the task hits below.
             raw_targets = data.pop(self.target_lang_key, None) or []
             source_lang = data.pop(self.source_lang_key, "")
-
-            # Skip tasks marked with `skip_me_key`
-            skip_me = data.get(self.skip_me_key, "")
-            if skip_me:
-                continue
 
             # Skip tasks with empty text
             text = data.get(self.text_key, "")
