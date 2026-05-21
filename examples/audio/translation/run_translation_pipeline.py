@@ -77,10 +77,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--translation_prompt",
         type=str,
         default=None,
-        help="Optional inline translation prompt template. Mutually exclusive with --prompt_file.",
+        help="Optional inline translation prompt template. Mutually exclusive with --translation_prompt_file.",
     )
     translation_prompt_group.add_argument(
-        "--prompt_file",
+        "--translation_prompt_file",
         type=str,
         default=None,
         help=(
@@ -198,7 +198,7 @@ def main() -> None:
         LLMTranslationStage(
             model_id=args.model_id,
             translation_prompt=args.translation_prompt,
-            translation_prompt_file=args.prompt_file,
+            translation_prompt_file=args.translation_prompt_file,
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
             text_key=args.text_key,
