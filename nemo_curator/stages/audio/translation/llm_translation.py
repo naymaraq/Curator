@@ -80,6 +80,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     max_output_tokens: int = 1024
     max_model_len: int = 4096
     max_num_seqs: int = 16
+    max_num_batched_tokens: int | None = None
     gpu_memory_utilization: float = 0.95
     kv_cache_dtype: str = "fp8"
     temperature: float = 0.7
@@ -103,9 +104,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     _n_inputs_logged: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        tp = self.tensor_parallel_size
-        if tp and tp > 0:
-            self.resources = Resources(gpus=float(tp))
+        if not self.tensor_parallel_size or self.tensor_parallel_size <= 0:
+            from nemo_curator.utils.gpu_utils import get_gpu_count
+            self.tensor_parallel_size = get_gpu_count()
+        self.resources = Resources(gpus=float(self.tensor_parallel_size))
 
         self._translation_prompt = self._resolve_prompt(
             inline=self.translation_prompt,
@@ -158,15 +160,15 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         if not VLLM_AVAILABLE:
             raise ImportError("vLLM is required for LLMTranslationStage. pip install vllm")
 
-        from nemo_curator.utils.gpu_utils import get_gpu_count
-
-        tp = self.tensor_parallel_size or get_gpu_count()
+        max_num_batched_tokens = self.max_num_batched_tokens or max(self.max_model_len, 8192)
 
         logger.info(
-            "LLMTranslation: loading {} (tp={}, max_model_len={}, kv_cache_dtype={})",
+            "LLMTranslation: loading {} (tp={}, max_model_len={}, "
+            "max_num_batched_tokens={}, kv_cache_dtype={})",
             self.model_id,
-            tp,
+            self.tensor_parallel_size,
             self.max_model_len,
+            max_num_batched_tokens,
             self.kv_cache_dtype,
         )
 
@@ -174,10 +176,10 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             model=self.model_id,
             trust_remote_code=True,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            tensor_parallel_size=tp,
+            tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
-            max_num_batched_tokens=8192,
+            max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=True,
             prefix_caching_hash_algo="xxhash",
             kv_cache_dtype=self.kv_cache_dtype,

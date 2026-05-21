@@ -158,6 +158,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max_output_tokens", type=int, default=1024)
     ap.add_argument("--max_model_len", type=int, default=4096)
     ap.add_argument("--max_num_seqs", type=int, default=16)
+    ap.add_argument(
+        "--max_num_batched_tokens",
+        type=int,
+        default=None,
+        help="vLLM max batched tokens per step. Defaults to max(max_model_len, 8192).",
+    )
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
     ap.add_argument("--kv_cache_dtype", type=str, default="fp8", help="KV-cache dtype passed to vLLM.")
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -203,6 +209,7 @@ def main() -> None:
             max_output_tokens=args.max_output_tokens,
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_dtype=args.kv_cache_dtype,
             temperature=args.temperature,

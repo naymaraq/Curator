@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from loguru import logger
+
 from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
@@ -112,9 +114,16 @@ class LanguageResolverStage(ProcessingStage[AudioTask, AudioTask]):
         if src_norm == "en":
             targets = list(self._en_to_x_names)
         elif src_norm and src_norm in self._target_set:
-            targets = ["English"]
+            targets = [LANGUAGE_MAP["en"]]
         else:
             targets = []
+            if not src_norm:
+                logger.warning("LanguageResolver: row with empty/missing source_lang skipped")
+            else:
+                logger.warning(
+                    "LanguageResolver: source_lang '{}' not in target set; row skipped",
+                    raw_src,
+                )
 
         task.data[self.translate_to_key] = targets
         return task
