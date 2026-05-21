@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LLM-based translation pipeline.
+"""LLM-based translation pipeline (text-only, vLLM).
 
 Reads a JSONL manifest of ``text`` + ``source_lang`` (code) entries and
 produces ``data["translations"]`` keyed by target language display name.
@@ -21,7 +21,7 @@ over the codes passed via ``--target_langs``.
 
 Architecture:
     ManifestReader (CPU)
-        -> reads JSONL manifest(s), emits one AudioTask per line
+        -> reads JSONL manifest(s), emits one Task per line
     LanguageResolverStage (CPU)
         -> resolves source_lang code -> source_lang_name (display name)
            and writes per-row translate_to list (En->X / X->En only)
@@ -78,13 +78,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to translation prompt template. Falls back to the stage's bundled default if unset.",
     )
-    ap.add_argument(
+    system_prompt_group = ap.add_mutually_exclusive_group()
+    system_prompt_group.add_argument(
         "--system_prompt",
         type=str,
         default=None,
         help="Optional inline system prompt string. Mutually exclusive with --system_prompt_file.",
     )
-    ap.add_argument(
+    system_prompt_group.add_argument(
         "--system_prompt_file",
         type=str,
         default=None,
