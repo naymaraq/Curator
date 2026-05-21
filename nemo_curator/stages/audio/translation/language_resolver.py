@@ -61,9 +61,9 @@ def lang_code_to_name(lang_code: str) -> str:
 class LanguageResolverStage(ProcessingStage[AudioTask, AudioTask]):
     """Populate display-name language fields and per-row target lists.
 
-    Additive — never overwrites existing manifest fields. Writes
-    ``source_lang_name`` (display name of the source) and ``translate_to``
-    (list of target display names) onto each task.
+    Writes ``source_lang_name`` (display name of the source) and
+    ``translate_to`` (list of target display names) onto each task,
+    overwriting any pre-existing values under those keys.
 
     Direction rules (``T`` = normalized set of ``target_lang_codes``):
         * ``source_lang == "en"``           -> translate_to = T \\ {en}  (En->X)

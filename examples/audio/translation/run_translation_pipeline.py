@@ -72,11 +72,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="Qwen/Qwen3.5-35B-A3B-FP8", 
         help="Translation LLM model id."
     )
-    ap.add_argument(
+    translation_prompt_group = ap.add_mutually_exclusive_group()
+    translation_prompt_group.add_argument(
+        "--translation_prompt",
+        type=str,
+        default=None,
+        help="Optional inline translation prompt template. Mutually exclusive with --prompt_file.",
+    )
+    translation_prompt_group.add_argument(
         "--prompt_file",
         type=str,
         default=None,
-        help="Path to translation prompt template. Falls back to the stage's bundled default if unset.",
+        help=(
+            "Path to translation prompt template. Falls back to the stage's bundled default if unset. "
+            "Mutually exclusive with --translation_prompt."
+        ),
     )
     system_prompt_group = ap.add_mutually_exclusive_group()
     system_prompt_group.add_argument(
@@ -171,10 +181,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
-    manifest_path: str | list[str] = args.manifest if len(args.manifest) > 1 else args.manifest[0]
-
     stages = [
-        ManifestReader(manifest_path=manifest_path),
+        ManifestReader(manifest_path=args.manifest),
         LanguageResolverStage(
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
@@ -183,6 +191,7 @@ def main() -> None:
         ),
         LLMTranslationStage(
             model_id=args.model_id,
+            translation_prompt=args.translation_prompt,
             translation_prompt_file=args.prompt_file,
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
