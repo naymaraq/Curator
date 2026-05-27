@@ -48,6 +48,41 @@ def _shard_is_done(output_dir: str, shard_id: str, directions: list[tuple[str, s
     )
 
 
+def all_shards_done(
+    manifest_paths: list[str],
+    output_dir: str,
+    target_lang_codes: list[str],
+    shard_size: int = 1000,
+) -> bool:
+    """Return True if every shard across all manifests is already complete.
+
+    Useful as a pre-flight check before starting the pipeline — if this
+    returns True the caller can skip ``pipeline.run()`` entirely and go
+    straight to ``reconcile_manifests()``, avoiding unnecessary Ray worker
+    initialisation (and potential segfaults during setup).
+
+    Args:
+        manifest_paths:    Same list passed to ``ShardedManifestReaderStage``.
+        output_dir:        Same ``output_dir`` passed to the stage.
+        target_lang_codes: Same target language codes passed to the stage.
+        shard_size:        Same shard size passed to the stage.
+    """
+    target_codes = [_normalize_code(c) for c in target_lang_codes]
+    directions: list[tuple[str, str]] = []
+    for code in target_codes:
+        if code != "en":
+            directions.append(("en", code))
+            directions.append((code, "en"))
+    directions = list(dict.fromkeys(directions))
+
+    for manifest_path in manifest_paths:
+        for _path, shard_idx, _start, _end in _collect_shard_descriptors(manifest_path, shard_size):
+            shard_id = f"{Path(manifest_path).stem}_{shard_idx}"
+            if not _shard_is_done(output_dir, shard_id, directions):
+                return False
+    return True
+
+
 def _collect_shard_descriptors(
     manifest_path: str,
     shard_size: int,

@@ -81,6 +81,7 @@ from nemo_curator.stages.audio import (
     TranslationExpanderStage,
     reconcile_manifests,
 )
+from nemo_curator.stages.audio.translation.sharded_manifest_reader import all_shards_done
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -253,12 +254,18 @@ def main() -> None:
     pipeline = Pipeline(name="translation_pipeline", stages=stages)
     logger.info("Pipeline:\n{}", pipeline.describe())
 
-    executor = XennaExecutor(config={"execution_mode": args.execution_mode})
-
     t0 = time.time()
-    pipeline.run(executor=executor)
-    pipeline_elapsed = time.time() - t0
-    logger.info("Pipeline finished in {:.1f} min.", pipeline_elapsed / 60)
+    if all_shards_done(
+        manifest_paths=args.manifest,
+        output_dir=args.output_dir,
+        target_lang_codes=args.target_langs,
+        shard_size=args.shard_size,
+    ):
+        logger.info("All shards are already complete — skipping pipeline.run().")
+    else:
+        executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+        pipeline.run(executor=executor)
+        logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
 
     if not args.skip_reconcile:
         logger.info("Reconciling shards → per-manifest per-direction manifests …")

@@ -16,7 +16,7 @@ from nemo_curator.stages.audio.translation.directional_writer import Directional
 from nemo_curator.stages.audio.translation.language_resolver import LanguageResolverStage
 from nemo_curator.stages.audio.translation.llm_translation import LLMTranslationStage
 from nemo_curator.stages.audio.translation.reconciler import list_pending_shards, reconcile_manifests
-from nemo_curator.stages.audio.translation.sharded_manifest_reader import ShardedManifestReaderStage
+from nemo_curator.stages.audio.translation.sharded_manifest_reader import ShardedManifestReaderStage, all_shards_done
 from nemo_curator.stages.audio.translation.translation_expander import TranslationExpanderStage
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "LanguageResolverStage",
     "ShardedManifestReaderStage",
     "TranslationExpanderStage",
+    "all_shards_done",
     "list_pending_shards",
     "reconcile_manifests",
 ]
