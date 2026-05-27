@@ -32,6 +32,7 @@ from typing import Any
 from fsspec.core import url_to_fs
 from loguru import logger
 
+from nemo_curator.stages.audio.translation.language_resolver import _normalize_code
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask, _EmptyTask
 
@@ -170,25 +171,39 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
 
     Each emitted ``AudioTask`` carries the following ``_metadata`` keys:
 
-    - ``shard_id``:        ``"{manifest_stem}_{shard_idx}"``
-    - ``manifest_stem``:   stem of the source manifest filename
-    - ``shard_item_idx``:  0-based index of this row within the shard
-    - ``shard_total``:     total non-empty lines in the shard
+    - ``shard_id``:          ``"{manifest_stem}_{shard_idx}"``
+    - ``manifest_stem``:     stem of the source manifest filename
+    - ``shard_item_idx``:    0-based index of this row within the shard
+    - ``shard_total``:       total source rows in the shard
+    - ``direction_counts``:  ``dict[str, int]`` mapping ``"{src}-{tgt}"`` to the
+                             number of rows in the shard that will produce tasks
+                             for that direction.  ``DirectionalShardedWriterStage``
+                             uses this to know when a (shard, direction) is
+                             fully written and can be renamed to ``.jsonl.done``.
 
     Args:
         manifest_paths:    One or more JSONL manifest paths (local or cloud).
         output_dir:        Output directory passed to ``DirectionalShardedWriterStage``;
                            used to locate shard completion markers.
-        target_lang_codes: ISO 639-1 codes of all target languages (passed through
-                           to ``LanguageResolverStage``; not used for done-checks).
+        target_lang_codes: ISO 639-1 codes of all target languages.  Used both
+                           to compute per-direction expected counts and to drive
+                           ``LanguageResolverStage`` downstream.
+        source_lang_key:   Row key holding the source-language ISO code
+                           (default: ``"source_lang"``).  Must match the key
+                           used by ``LanguageResolverStage``.
         shard_size:        Number of lines per shard (default: 1 000).
     """
 
     manifest_paths: list[str] = field(default_factory=list)
     output_dir: str = ""
     target_lang_codes: list[str] = field(default_factory=list)
+    source_lang_key: str = "source_lang"
     shard_size: int = 1000
     name: str = "ShardedManifestReader"
+
+    _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
+    _target_set: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
+    _en_to_x_codes: list[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.manifest_paths:
@@ -200,6 +215,18 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
         if not self.target_lang_codes:
             msg = "ShardedManifestReaderStage: target_lang_codes must be non-empty"
             raise ValueError(msg)
+
+        self._target_codes_norm = [_normalize_code(c) for c in self.target_lang_codes]
+        self._target_set = frozenset(self._target_codes_norm)
+        self._en_to_x_codes = [c for c in self._target_codes_norm if c != "en"]
+
+    def _row_targets(self, src_norm: str) -> list[str]:
+        """Mirror LanguageResolverStage's direction rules to enumerate per-row targets."""
+        if src_norm == "en":
+            return list(self._en_to_x_codes)
+        if src_norm and src_norm in self._target_set:
+            return ["en"]
+        return []
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -254,8 +281,7 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
     ) -> list[AudioTask]:
         shard_total = end_line - start_line
         fs, resolved = url_to_fs(manifest_path)
-        tasks: list[AudioTask] = []
-        item_idx = 0
+        rows: list[dict[str, Any]] = []
         line_no = 0
 
         with fs.open(resolved, "r", encoding="utf-8") as f:
@@ -267,30 +293,45 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
                     continue
                 if line_no >= end_line:
                     break
-
-                metadata: dict[str, Any] = {
-                    "shard_id": shard_id,
-                    "manifest_stem": manifest_stem,
-                    "shard_item_idx": item_idx,
-                    "shard_total": shard_total,
-                }
-                tasks.append(
-                    AudioTask(
-                        task_id=f"{shard_id}_{item_idx}",
-                        dataset_name=manifest_stem,
-                        data=json.loads(raw_line.strip()),
-                        _metadata=metadata,
-                    )
-                )
-                item_idx += 1
+                rows.append(json.loads(raw_line.strip()))
                 line_no += 1
 
+        # Compute per-direction expected row counts for this shard.  Mirrors
+        # LanguageResolverStage direction rules so the writer knows exactly when
+        # each (shard, direction) is complete.
+        direction_counts: dict[str, int] = {}
+        for row in rows:
+            src_raw = row.get(self.source_lang_key, "")
+            src_norm = _normalize_code(src_raw) if src_raw else ""
+            for tgt_norm in self._row_targets(src_norm):
+                key = f"{src_norm}-{tgt_norm}"
+                direction_counts[key] = direction_counts.get(key, 0) + 1
+
+        tasks: list[AudioTask] = []
+        for item_idx, row in enumerate(rows):
+            metadata: dict[str, Any] = {
+                "shard_id": shard_id,
+                "manifest_stem": manifest_stem,
+                "shard_item_idx": item_idx,
+                "shard_total": shard_total,
+                "direction_counts": dict(direction_counts),
+            }
+            tasks.append(
+                AudioTask(
+                    task_id=f"{shard_id}_{item_idx}",
+                    dataset_name=manifest_stem,
+                    data=row,
+                    _metadata=metadata,
+                )
+            )
+
         logger.debug(
-            "ShardedManifestReader: shard {} lines [{}, {}) → {} tasks",
+            "ShardedManifestReader: shard {} lines [{}, {}) → {} tasks, direction_counts={}",
             shard_id,
             start_line,
             end_line,
             len(tasks),
+            direction_counts,
         )
         return tasks
 

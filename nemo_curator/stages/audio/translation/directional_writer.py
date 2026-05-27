@@ -20,16 +20,19 @@ Writes each expanded ``AudioTask`` to::
 
 Per-direction completion
 ------------------------
-Each ``AudioTask`` carries ``shard_total`` in its ``_metadata`` — the number
-of source rows in the originating shard.  After fan-out by
-``TranslationExpanderStage``, each direction receives exactly ``shard_total``
-tasks.  The writer tracks a per-direction row counter; when the counter
-reaches ``shard_total`` the file handle is closed and the file is immediately
-renamed to ``{handle_key}.jsonl.done``.  This avoids relying on ``teardown()``
-being called by the execution framework.
+Each ``AudioTask`` carries ``direction_counts`` in its ``_metadata`` — a
+``dict[str, int]`` produced by ``ShardedManifestReaderStage`` that maps
+``"{src}-{tgt}"`` to the exact number of tasks that direction will receive
+for the originating shard.
 
-Shard-level completion markers are written externally by
-``mark_complete_shards()`` after ``pipeline.run()`` returns.
+The writer tracks a per-direction row counter (``_seen_counts``); when the
+counter reaches the expected count for that direction, the file handle is
+closed and the file is immediately renamed to ``{handle_key}.jsonl.done``
+inside ``process()``.  This avoids relying on ``teardown()`` being called by
+the execution framework (Xenna currently does not call it).
+
+Shard-level completion markers (``{shard_id}.shard.done``) are written
+externally by ``mark_complete_shards()`` after ``pipeline.run()`` returns.
 
 Resume behaviour
 ----------------
@@ -41,9 +44,11 @@ so stale partial data from the previous run is discarded and replaced.
 
 Safety net
 ----------
-``teardown()`` is kept as a safety net: it closes and renames any direction
-files that did not reach ``shard_total`` (e.g. if ``shard_total`` was
-unavailable or some tasks were dropped upstream).
+``teardown()`` is kept as a safety net: if the runtime ever does call it, it
+closes and renames any direction files still open (e.g. if some upstream
+tasks were dropped so the per-direction counter never reached its expected
+value).  In normal operation it is a no-op because every direction is
+already renamed inline.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from fsspec.core import url_to_fs
 from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
+from nemo_curator.stages.audio.translation.language_resolver import _normalize_code
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
@@ -69,9 +75,10 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
         {output_dir}/shards/{shard_id}_{source_lang}-{target_lang}.jsonl
 
-    All ``.done`` markers are written at ``teardown()`` time, after every
-    task has been processed, ensuring no direction file is marked complete
-    before all its rows have been flushed.
+    Per-direction completion happens inline in ``process()``: once a
+    ``handle_key`` has received as many rows as ``task._metadata['direction_counts']``
+    says it should, the file is closed and renamed to ``.jsonl.done`` immediately.
+    ``teardown()`` is a safety net only.
 
     If a direction's ``.done`` file already exists (from a prior successful
     run), that direction is skipped entirely — its data is kept as-is.
@@ -94,8 +101,6 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     _handles: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     # Rows written per handle_key (for per-direction completion detection).
     _seen_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
-    # Expected row count per shard_id (= shard_total from task metadata).
-    _shard_totals: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _shards_dir: str = field(default="", init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _n_skipped_done: int = field(default=0, init=False, repr=False)
@@ -123,11 +128,15 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
         """Safety-net: close and rename any direction files still open after processing.
 
         Under normal operation all direction files are completed inline in
-        ``process()`` when their row counter reaches ``shard_total``.  This
-        method handles edge cases where ``shard_total`` was unavailable or tasks
-        were dropped upstream, leaving open handles.  It does NOT write
+        ``process()`` once their row counter reaches the expected count from
+        ``task._metadata['direction_counts']``.  This method only handles edge
+        cases where the expected count was missing or some upstream tasks were
+        dropped, leaving open handles.  It does NOT write
         ``{shard_id}.shard.done`` markers — that is the responsibility of
         ``mark_complete_shards()`` called from the pipeline runner.
+
+        Note: the Xenna executor currently does not invoke ``teardown()`` on
+        stage adapters, so do not rely on this method for correctness.
         """
         safety_net_renamed: list[str] = []
         for key in list(self._handles.keys()):
@@ -175,22 +184,22 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         shard_id: str = task._metadata.get("shard_id", "unknown_shard")
-        shard_total: int = task._metadata.get("shard_total", -1)
+        direction_counts: dict[str, int] = task._metadata.get("direction_counts", {})
 
-        # Record the expected row count for this shard (same for all tasks in a shard).
-        if shard_total > 0:
-            self._shard_totals[shard_id] = shard_total
+        src_raw = task.data.get(self.source_lang_key, "")
+        tgt_raw = task.data.get(self.target_lang_key, "")
 
-        src = task.data.get(self.source_lang_key, "")
-        tgt = task.data.get(self.target_lang_key, "")
-
-        if not src or not tgt:
+        if not src_raw or not tgt_raw:
             logger.warning(
                 "DirectionalShardedWriter: task {} missing source/target lang keys; skipping write",
                 task.task_id,
             )
             return task
 
+        # Normalize source/target codes so handle_key matches the keys produced
+        # by ShardedManifestReaderStage in `direction_counts`.
+        src = _normalize_code(src_raw)
+        tgt = _normalize_code(tgt_raw)
         direction = f"{src}-{tgt}"
         handle_key = f"{shard_id}_{direction}"
 
@@ -212,8 +221,8 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
         self._n_written += 1
         self._seen_counts[handle_key] += 1
 
-        # Complete the direction immediately once all rows have been written.
-        expected = self._shard_totals.get(shard_id, -1)
+        # Complete the direction immediately once all expected rows have been written.
+        expected = direction_counts.get(direction, -1)
         if expected > 0 and self._seen_counts[handle_key] >= expected:
             self._complete_direction(handle_key)
 

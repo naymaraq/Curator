@@ -207,6 +207,7 @@ def main() -> None:
             manifest_paths=args.manifest,
             output_dir=args.output_dir,
             target_lang_codes=args.target_langs,
+            source_lang_key=args.source_lang_code_key,
             shard_size=args.shard_size,
         ),
         LanguageResolverStage(
