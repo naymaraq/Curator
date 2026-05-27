@@ -55,6 +55,7 @@ from nemo_curator.stages.audio.translation import (
     TranslationExpanderStage,
     all_shards_done,
     list_pending_shards,
+    mark_complete_shards,
     reconcile_manifests,
     shard_done_marker_path,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "VADSegmentationStage",
     "all_shards_done",
     "list_pending_shards",
+    "mark_complete_shards",
     "reconcile_manifests",
     "shard_done_marker_path",
 ]

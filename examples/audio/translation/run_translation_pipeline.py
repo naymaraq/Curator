@@ -80,6 +80,7 @@ from nemo_curator.stages.audio import (
     ShardedManifestReaderStage,
     TranslationExpanderStage,
     all_shards_done,
+    mark_complete_shards,
     reconcile_manifests,
 )
 
@@ -266,6 +267,11 @@ def main() -> None:
         executor = XennaExecutor(config={"execution_mode": args.execution_mode})
         pipeline.run(executor=executor)
         logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
+
+        # Write .shard.done markers for every fully-written shard.  Xenna does
+        # not call teardown() on our stages, so this must be done here.
+        n_marked = mark_complete_shards(output_dir=args.output_dir)
+        logger.info("mark_complete_shards: {} new shard marker(s) written.", n_marked)
 
     if not args.skip_reconcile:
         logger.info("Reconciling shards → per-manifest per-direction manifests …")

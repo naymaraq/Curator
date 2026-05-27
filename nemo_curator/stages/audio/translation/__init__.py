@@ -19,6 +19,7 @@ from nemo_curator.stages.audio.translation.reconciler import list_pending_shards
 from nemo_curator.stages.audio.translation.sharded_manifest_reader import (
     ShardedManifestReaderStage,
     all_shards_done,
+    mark_complete_shards,
     shard_done_marker_path,
 )
 from nemo_curator.stages.audio.translation.translation_expander import TranslationExpanderStage
@@ -31,6 +32,7 @@ __all__ = [
     "TranslationExpanderStage",
     "all_shards_done",
     "list_pending_shards",
+    "mark_complete_shards",
     "reconcile_manifests",
     "shard_done_marker_path",
 ]

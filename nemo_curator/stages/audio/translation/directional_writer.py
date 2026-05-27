@@ -18,27 +18,32 @@ Writes each expanded ``AudioTask`` to::
 
     {output_dir}/shards/{shard_id}_{src}-{tgt}.jsonl
 
-All ``.done`` renaming happens in ``teardown()``, which is called after
-every task has been processed.  This avoids the race where per-task
-completion checks fire before all direction tasks from a shard have been
-written (tasks from the same original item but different directions can
-arrive interleaved due to parallel ``TranslationExpanderStage`` workers).
+Per-direction completion
+------------------------
+Each ``AudioTask`` carries ``shard_total`` in its ``_metadata`` — the number
+of source rows in the originating shard.  After fan-out by
+``TranslationExpanderStage``, each direction receives exactly ``shard_total``
+tasks.  The writer tracks a per-direction row counter; when the counter
+reaches ``shard_total`` the file handle is closed and the file is immediately
+renamed to ``{handle_key}.jsonl.done``.  This avoids relying on ``teardown()``
+being called by the execution framework.
 
-After renaming all direction files, ``teardown()`` writes a shard-level
-``{shard_id}.shard.done`` marker for every shard that had at least one
-direction processed.  ``ShardedManifestReaderStage`` checks only this
-single marker — not per-direction ``.done`` files — so the skip logic
-works regardless of which directions actually appeared in the data.
+Shard-level completion markers are written externally by
+``mark_complete_shards()`` after ``pipeline.run()`` returns.
 
 Resume behaviour
 ----------------
 If a ``.done`` file already exists for a given (shard, direction) pair,
-that direction is silently skipped — its data is already safe.  At the next
-``teardown()`` only the *newly written* ``.jsonl`` files are renamed to
-``.done``; existing ``.done`` files are never touched.
+that direction is silently skipped — its data is already safe.
 
 On a retry after a crash, new shard files are opened with ``"w"`` (truncate)
 so stale partial data from the previous run is discarded and replaced.
+
+Safety net
+----------
+``teardown()`` is kept as a safety net: it closes and renames any direction
+files that did not reach ``shard_total`` (e.g. if ``shard_total`` was
+unavailable or some tasks were dropped upstream).
 """
 
 from __future__ import annotations
@@ -53,7 +58,6 @@ from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.audio.translation.sharded_manifest_reader import shard_done_marker_path
 from nemo_curator.tasks import AudioTask
 
 
@@ -88,12 +92,14 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
     # Open file handles: "{shard_id}_{src}-{tgt}" → file-like object.
     _handles: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    # All shard IDs seen during this worker's lifetime (for shard-level markers).
-    _seen_shard_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    # Rows written per handle_key (for per-direction completion detection).
+    _seen_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    # Expected row count per shard_id (= shard_total from task metadata).
+    _shard_totals: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _shards_dir: str = field(default="", init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _n_skipped_done: int = field(default=0, init=False, repr=False)
-    _n_shard_markers_written: int = field(default=0, init=False, repr=False)
+    _n_directions_completed: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.output_dir:
@@ -114,55 +120,48 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
         os.makedirs(self._shards_dir, exist_ok=True)
 
     def teardown(self) -> None:
-        """Flush + close all open handles, then rename each new shard file to ``.done``.
+        """Safety-net: close and rename any direction files still open after processing.
 
-        After all direction files are renamed, writes a ``{shard_id}.shard.done``
-        marker for every shard seen during this worker's lifetime so that
-        ``ShardedManifestReaderStage`` can skip the shard on the next run.
-
-        Existing ``.done`` files are never overwritten.
+        Under normal operation all direction files are completed inline in
+        ``process()`` when their row counter reaches ``shard_total``.  This
+        method handles edge cases where ``shard_total`` was unavailable or tasks
+        were dropped upstream, leaving open handles.  It does NOT write
+        ``{shard_id}.shard.done`` markers — that is the responsibility of
+        ``mark_complete_shards()`` called from the pipeline runner.
         """
-        renamed: list[str] = []
-        handle_keys = list(self._handles.keys())
-        for key in handle_keys:
-            fh = self._handles.pop(key, None)
-            if fh is not None:
-                try:
-                    fh.close()
-                except Exception:  # noqa: BLE001
-                    pass
-
-            src_path = os.path.join(self._shards_dir, f"{key}.jsonl")
-            dst_path = f"{src_path}.done"
-            # Guard: never overwrite an existing .done file.
-            if os.path.exists(src_path) and not os.path.exists(dst_path):
-                os.rename(src_path, dst_path)
-                renamed.append(key)
-
-        # Write a single shard-level marker for each completed shard so the
-        # reader only needs to check one file per shard (not one per direction).
-        for shard_id in self._seen_shard_ids:
-            marker = shard_done_marker_path(self.output_dir, shard_id)
-            if not os.path.exists(marker):
-                try:
-                    with open(marker, "w") as _f:
-                        pass
-                    self._n_shard_markers_written += 1
-                    logger.info("DirectionalShardedWriter: shard marker written → {}", marker)
-                except OSError as exc:
-                    logger.warning("DirectionalShardedWriter: could not write shard marker {}: {}", marker, exc)
+        safety_net_renamed: list[str] = []
+        for key in list(self._handles.keys()):
+            self._complete_direction(key)
+            safety_net_renamed.append(key)
 
         logger.info(
-            "DirectionalShardedWriter: teardown — {}/{} shard-direction file(s) marked .done, "
-            "{} shard marker(s) newly written ({} already existed), "
+            "DirectionalShardedWriter: teardown — {} direction(s) completed inline, "
+            "{} direction(s) completed in safety-net teardown, "
             "{} rows written, {} rows skipped (already done)",
-            len(renamed),
-            len(handle_keys),
-            self._n_shard_markers_written,
-            len(self._seen_shard_ids) - self._n_shard_markers_written,
+            self._n_directions_completed,
+            len(safety_net_renamed),
             self._n_written,
             self._n_skipped_done,
         )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _complete_direction(self, handle_key: str) -> None:
+        """Close the open file handle for ``handle_key`` and rename to ``.done``."""
+        fh = self._handles.pop(handle_key, None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                pass
+        src_path = os.path.join(self._shards_dir, f"{handle_key}.jsonl")
+        dst_path = f"{src_path}.done"
+        if os.path.exists(src_path) and not os.path.exists(dst_path):
+            os.rename(src_path, dst_path)
+            self._n_directions_completed += 1
+            logger.info("DirectionalShardedWriter: direction complete → {}", dst_path)
 
     # ------------------------------------------------------------------
     # ProcessingStage interface
@@ -176,11 +175,14 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         shard_id: str = task._metadata.get("shard_id", "unknown_shard")
-        self._seen_shard_ids.add(shard_id)
+        shard_total: int = task._metadata.get("shard_total", -1)
+
+        # Record the expected row count for this shard (same for all tasks in a shard).
+        if shard_total > 0:
+            self._shard_totals[shard_id] = shard_total
 
         src = task.data.get(self.source_lang_key, "")
         tgt = task.data.get(self.target_lang_key, "")
-        direction = f"{src}-{tgt}"
 
         if not src or not tgt:
             logger.warning(
@@ -189,6 +191,7 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
             )
             return task
 
+        direction = f"{src}-{tgt}"
         handle_key = f"{shard_id}_{direction}"
 
         # If this direction's .done file already exists from a prior run, skip.
@@ -202,10 +205,17 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
             fs, resolved = url_to_fs(shard_path)
             # "w" truncates any stale partial file from a previous crashed run.
             self._handles[handle_key] = fs.open(resolved, "w", encoding="utf-8")
+            self._seen_counts[handle_key] = 0
 
         self._handles[handle_key].write(json.dumps(task.data, ensure_ascii=False) + "\n")
         self._handles[handle_key].flush()
         self._n_written += 1
+        self._seen_counts[handle_key] += 1
+
+        # Complete the direction immediately once all rows have been written.
+        expected = self._shard_totals.get(shard_id, -1)
+        if expected > 0 and self._seen_counts[handle_key] >= expected:
+            self._complete_direction(handle_key)
 
         return AudioTask(
             task_id=task.task_id,

@@ -46,6 +46,69 @@ def _shard_is_done(output_dir: str, shard_id: str) -> bool:
     return os.path.exists(shard_done_marker_path(output_dir, shard_id))
 
 
+def mark_complete_shards(output_dir: str) -> int:
+    """Write ``{shard_id}.shard.done`` for every shard with no orphan ``.jsonl`` files.
+
+    Called from the pipeline runner after ``pipeline.run()`` returns.  At that
+    point all tasks have been processed, so any shard whose direction files have
+    all been renamed to ``.jsonl.done`` (no bare ``.jsonl`` remaining) is fully
+    complete and can be marked for skipping on the next run.
+
+    Args:
+        output_dir: Root output directory (same as passed to the pipeline stages).
+
+    Returns:
+        Number of new ``.shard.done`` markers written.
+    """
+    shards_dir = os.path.join(output_dir, "shards")
+    if not os.path.isdir(shards_dir):
+        logger.warning("mark_complete_shards: shards dir not found: {}", shards_dir)
+        return 0
+
+    done_shards: set[str] = set()
+    orphan_shards: set[str] = set()
+
+    for fname in os.listdir(shards_dir):
+        # Direction done files: {shard_id}_{src}-{tgt}.jsonl.done
+        if fname.endswith(".jsonl.done"):
+            base = fname[: -len(".jsonl.done")]
+            parts = base.rsplit("_", 1)
+            if len(parts) == 2 and "-" in parts[1]:
+                done_shards.add(parts[0])
+        # Orphan direction files: {shard_id}_{src}-{tgt}.jsonl  (incomplete)
+        elif fname.endswith(".jsonl"):
+            base = fname[: -len(".jsonl")]
+            parts = base.rsplit("_", 1)
+            if len(parts) == 2 and "-" in parts[1]:
+                orphan_shards.add(parts[0])
+
+    written = 0
+    for shard_id in done_shards - orphan_shards:
+        marker = shard_done_marker_path(output_dir, shard_id)
+        if not os.path.exists(marker):
+            try:
+                with open(marker, "w") as _f:
+                    pass
+                written += 1
+                logger.info("mark_complete_shards: shard marker written → {}", marker)
+            except OSError as exc:
+                logger.warning("mark_complete_shards: could not write marker {}: {}", marker, exc)
+
+    logger.info(
+        "mark_complete_shards: {}/{} shard(s) marked done ({} already had marker)",
+        written,
+        len(done_shards - orphan_shards),
+        len(done_shards - orphan_shards) - written,
+    )
+    if orphan_shards:
+        logger.warning(
+            "mark_complete_shards: {} shard(s) still have incomplete direction files: {}",
+            len(orphan_shards),
+            sorted(orphan_shards),
+        )
+    return written
+
+
 def all_shards_done(
     manifest_paths: list[str],
     output_dir: str,
