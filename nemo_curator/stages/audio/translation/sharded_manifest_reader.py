@@ -36,16 +36,14 @@ from nemo_curator.stages.audio.translation.language_resolver import _normalize_c
 from nemo_curator.tasks import AudioTask, _EmptyTask
 
 
-def _direction_done_path(output_dir: str, shard_id: str, src: str, tgt: str) -> str:
-    return os.path.join(output_dir, "shards", f"{shard_id}_{src}-{tgt}.jsonl.done")
+def shard_done_marker_path(output_dir: str, shard_id: str) -> str:
+    """Return the path of the shard-level completion marker file."""
+    return os.path.join(output_dir, "shards", f"{shard_id}.shard.done")
 
 
-def _shard_is_done(output_dir: str, shard_id: str, directions: list[tuple[str, str]]) -> bool:
-    """Return True if every direction's .done file exists for this shard."""
-    return all(
-        os.path.exists(_direction_done_path(output_dir, shard_id, src, tgt))
-        for src, tgt in directions
-    )
+def _shard_is_done(output_dir: str, shard_id: str, _directions: object = None) -> bool:
+    """Return True if the shard-level completion marker exists for this shard."""
+    return os.path.exists(shard_done_marker_path(output_dir, shard_id))
 
 
 def all_shards_done(
@@ -64,21 +62,13 @@ def all_shards_done(
     Args:
         manifest_paths:    Same list passed to ``ShardedManifestReaderStage``.
         output_dir:        Same ``output_dir`` passed to the stage.
-        target_lang_codes: Same target language codes passed to the stage.
+        target_lang_codes: Unused — kept for API compatibility.
         shard_size:        Same shard size passed to the stage.
     """
-    target_codes = [_normalize_code(c) for c in target_lang_codes]
-    directions: list[tuple[str, str]] = []
-    for code in target_codes:
-        if code != "en":
-            directions.append(("en", code))
-            directions.append((code, "en"))
-    directions = list(dict.fromkeys(directions))
-
     for manifest_path in manifest_paths:
         for _path, shard_idx, _start, _end in _collect_shard_descriptors(manifest_path, shard_size):
             shard_id = f"{Path(manifest_path).stem}_{shard_idx}"
-            if not _shard_is_done(output_dir, shard_id, directions):
+            if not _shard_is_done(output_dir, shard_id):
                 return False
     return True
 
@@ -123,12 +113,12 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
     - ``shard_total``:     total non-empty lines in the shard
 
     Args:
-        manifest_paths:   One or more JSONL manifest paths (local or cloud).
-        output_dir:       Output directory passed to ``DirectionalShardedWriterStage``;
-                          used to locate ``.done`` marker files.
-        target_lang_codes: ISO 639-1 codes of all target languages (used to
-                           determine which direction ``.done`` files to check).
-        shard_size:       Number of lines per shard (default: 1 000).
+        manifest_paths:    One or more JSONL manifest paths (local or cloud).
+        output_dir:        Output directory passed to ``DirectionalShardedWriterStage``;
+                           used to locate shard completion markers.
+        target_lang_codes: ISO 639-1 codes of all target languages (passed through
+                           to ``LanguageResolverStage``; not used for done-checks).
+        shard_size:        Number of lines per shard (default: 1 000).
     """
 
     manifest_paths: list[str] = field(default_factory=list)
@@ -136,8 +126,6 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
     target_lang_codes: list[str] = field(default_factory=list)
     shard_size: int = 1000
     name: str = "ShardedManifestReader"
-
-    _directions: list[tuple[str, str]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.manifest_paths:
@@ -149,19 +137,6 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
         if not self.target_lang_codes:
             msg = "ShardedManifestReaderStage: target_lang_codes must be non-empty"
             raise ValueError(msg)
-
-        # Pre-compute all expected directions so shard-done checks are fast.
-        # Mirrors LanguageResolverStage direction rules:
-        #   en -> X (for each non-en target)
-        #   X -> en (for each non-en target that appears in sources)
-        # We conservatively include both directions for every non-en target.
-        target_codes = [_normalize_code(c) for c in self.target_lang_codes]
-        directions: list[tuple[str, str]] = []
-        for code in target_codes:
-            if code != "en":
-                directions.append(("en", code))
-                directions.append((code, "en"))
-        self._directions = list(dict.fromkeys(directions))  # deduplicate, preserve order
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -187,7 +162,7 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
             for manifest_path_inner, shard_idx, start_line, end_line in descriptors:
                 shard_id = f"{manifest_stem}_{shard_idx}"
 
-                if _shard_is_done(self.output_dir, shard_id, self._directions):
+                if _shard_is_done(self.output_dir, shard_id):
                     logger.info("ShardedManifestReader: skipping done shard {}", shard_id)
                     total_skipped_shards += 1
                     continue

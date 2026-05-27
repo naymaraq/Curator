@@ -24,6 +24,12 @@ completion checks fire before all direction tasks from a shard have been
 written (tasks from the same original item but different directions can
 arrive interleaved due to parallel ``TranslationExpanderStage`` workers).
 
+After renaming all direction files, ``teardown()`` writes a shard-level
+``{shard_id}.shard.done`` marker for every shard that had at least one
+direction processed.  ``ShardedManifestReaderStage`` checks only this
+single marker — not per-direction ``.done`` files — so the skip logic
+works regardless of which directions actually appeared in the data.
+
 Resume behaviour
 ----------------
 If a ``.done`` file already exists for a given (shard, direction) pair,
@@ -33,9 +39,6 @@ that direction is silently skipped — its data is already safe.  At the next
 
 On a retry after a crash, new shard files are opened with ``"w"`` (truncate)
 so stale partial data from the previous run is discarded and replaced.
-
-``ShardedManifestReaderStage`` skips a shard when **all** expected direction
-``.done`` files are present.
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.audio.translation.sharded_manifest_reader import shard_done_marker_path
 from nemo_curator.tasks import AudioTask
 
 
@@ -84,6 +88,8 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
     # Open file handles: "{shard_id}_{src}-{tgt}" → file-like object.
     _handles: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # All shard IDs seen during this worker's lifetime (for shard-level markers).
+    _seen_shard_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _shards_dir: str = field(default="", init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _n_skipped_done: int = field(default=0, init=False, repr=False)
@@ -109,6 +115,10 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     def teardown(self) -> None:
         """Flush + close all open handles, then rename each new shard file to ``.done``.
 
+        After all direction files are renamed, writes a ``{shard_id}.shard.done``
+        marker for every shard seen during this worker's lifetime so that
+        ``ShardedManifestReaderStage`` can skip the shard on the next run.
+
         Existing ``.done`` files are never overwritten.
         """
         renamed: list[str] = []
@@ -128,11 +138,24 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 os.rename(src_path, dst_path)
                 renamed.append(key)
 
+        # Write a single shard-level marker for each completed shard so the
+        # reader only needs to check one file per shard (not one per direction).
+        for shard_id in self._seen_shard_ids:
+            marker = shard_done_marker_path(self.output_dir, shard_id)
+            if not os.path.exists(marker):
+                try:
+                    with open(marker, "w") as _f:
+                        pass
+                    logger.info("DirectionalShardedWriter: shard marker written → {}", marker)
+                except OSError as exc:
+                    logger.warning("DirectionalShardedWriter: could not write shard marker {}: {}", marker, exc)
+
         logger.info(
             "DirectionalShardedWriter: teardown — {}/{} shard-direction file(s) marked .done, "
-            "{} rows written, {} rows skipped (already done)",
+            "{} shard marker(s) written, {} rows written, {} rows skipped (already done)",
             len(renamed),
             len(handle_keys),
+            len(self._seen_shard_ids),
             self._n_written,
             self._n_skipped_done,
         )
@@ -149,6 +172,7 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         shard_id: str = task._metadata.get("shard_id", "unknown_shard")
+        self._seen_shard_ids.add(shard_id)
 
         src = task.data.get(self.source_lang_key, "")
         tgt = task.data.get(self.target_lang_key, "")
