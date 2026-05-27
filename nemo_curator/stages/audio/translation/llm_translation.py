@@ -45,8 +45,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
     Reads source text plus pre-resolved language **display names** from each
     ``AudioTask.data`` dict (``source_lang_key`` and ``target_lang_key``;
-    populated upstream by ``LanguageResolverStage``) and writes the result
-    into ``data[translations_key]`` as a ``{display_name: translation}``
+    populated upstream by ``ShardedManifestReaderStage``) and writes the
+    result into ``data[translations_key]`` as a ``{display_name: translation}``
     mapping, so multiple target languages accumulate without overwriting
     prior entries. The scratch fields ``source_lang_key`` and
     ``target_lang_key`` are removed from each row after the prompts are
@@ -55,7 +55,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
     The prompt template uses fixed semantic placeholders ``{target_lang}``,
     ``{source_lang}``, ``{text}`` regardless of the actual manifest key
     names. ``{source_lang}`` is always populated from ``source_lang_key``,
-    which is mandatory and assumed pre-resolved by ``LanguageResolverStage``.
+    which is mandatory and assumed pre-resolved by the reader.
 
     Both the translation prompt and the system prompt have bundled defaults
     in ``prompts/`` (``translation_prompt.md`` and ``system_prompt.md``).
@@ -303,9 +303,9 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         for task_idx, task in enumerate(tasks):
             data = task.data
 
-            # Pop scratch fields written by LanguageResolverStage up-front so
-            # they never reach the output manifest, regardless of which skip
-            # branch (if any) the task hits below.
+            # Pop scratch fields written by ShardedManifestReaderStage
+            # up-front so they never reach the output manifest, regardless of
+            # which skip branch (if any) the task hits below.
             raw_targets = data.pop(self.target_lang_key, None) or []
             source_lang = data.pop(self.source_lang_key, "")
 

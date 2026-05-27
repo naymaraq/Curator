@@ -20,10 +20,8 @@ Architecture
 
     ShardedManifestReaderStage   (CPU, _EmptyTask → AudioTask)
         Reads one or more JSONL manifests in shards; skips shards that are
-        already complete from a prior run (.done markers).
-
-    LanguageResolverStage        (CPU, AudioTask → AudioTask)
-        Resolves source_lang code → display name; writes per-row
+        already complete from a prior run (.done markers).  Also resolves
+        source_lang ISO code → display name and writes the per-row
         translate_to list (En→X / X→En only).
 
     LLMTranslationStage          (GPU, AudioTask → AudioTask)
@@ -75,7 +73,6 @@ from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio import (
     DirectionalShardedWriterStage,
-    LanguageResolverStage,
     LLMTranslationStage,
     ShardedManifestReaderStage,
     TranslationExpanderStage,
@@ -120,7 +117,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Target language ISO codes (e.g. 'de fr ru ja'). "
-            "LanguageResolverStage generates En→X and X→En pairs."
+            "ShardedManifestReaderStage generates En→X and X→En pairs."
         ),
     )
     ap.add_argument(
@@ -133,13 +130,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--source_lang_name_key",
         type=str,
         default="source_lang_name",
-        help="Intermediate key for resolved source language display name.",
+        help="Intermediate key for resolved source language display name (written by the reader).",
     )
     ap.add_argument(
         "--target_lang_key",
         type=str,
         default="translate_to",
-        help="Intermediate key for per-row list of target language display names.",
+        help="Intermediate key for per-row list of target language display names (written by the reader).",
     )
 
     # ------------------------------------------------------------------ Model
@@ -191,11 +188,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="streaming",
         choices=["streaming", "batch"],
     )
-    ap.add_argument(
-        "--skip_reconcile",
-        action="store_true",
-        help="Skip the reconciliation step (useful when re-running only the main pipeline).",
-    )
     return ap
 
 
@@ -208,13 +200,9 @@ def main() -> None:
             output_dir=args.output_dir,
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
-            shard_size=args.shard_size,
-        ),
-        LanguageResolverStage(
-            target_lang_codes=args.target_langs,
-            source_lang_key=args.source_lang_code_key,
             source_lang_name_key=args.source_lang_name_key,
             translate_to_key=args.target_lang_key,
+            shard_size=args.shard_size,
         ),
         LLMTranslationStage(
             model_id=args.model_id,
@@ -274,11 +262,10 @@ def main() -> None:
         n_marked = mark_complete_shards(output_dir=args.output_dir)
         logger.info("mark_complete_shards: {} new shard marker(s) written.", n_marked)
 
-    if not args.skip_reconcile:
-        logger.info("Reconciling shards → per-manifest per-direction manifests …")
-        t1 = time.time()
-        reconcile_manifests(output_dir=args.output_dir)
-        logger.info("Reconciliation finished in {:.1f} s.", time.time() - t1)
+    logger.info("Reconciling shards → per-manifest per-direction manifests …")
+    t1 = time.time()
+    reconcile_manifests(output_dir=args.output_dir)
+    logger.info("Reconciliation finished in {:.1f} s.", time.time() - t1)
 
     logger.info(
         "Done. Output files are in: {}",

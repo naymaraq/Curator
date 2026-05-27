@@ -62,7 +62,7 @@ from fsspec.core import url_to_fs
 from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
-from nemo_curator.stages.audio.translation.language_resolver import _normalize_code
+from nemo_curator.stages.audio.translation.language_map import _normalize_code
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 

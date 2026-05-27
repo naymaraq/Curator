@@ -37,7 +37,8 @@ from nemo_curator.stages.audio.translation.language_map import name_to_code
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask
 
-# Scratch keys written by LanguageResolverStage that must not appear in output.
+# Scratch keys written onto each row by ``ShardedManifestReaderStage`` that
+# must not appear in the per-direction output rows.
 _RESOLVER_SCRATCH_KEYS = ("source_lang_name", "translate_to")
 
 

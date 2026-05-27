@@ -32,7 +32,7 @@ from typing import Any
 from fsspec.core import url_to_fs
 from loguru import logger
 
-from nemo_curator.stages.audio.translation.language_resolver import _normalize_code
+from nemo_curator.stages.audio.translation.language_map import LANGUAGE_MAP, _normalize_code, lang_code_to_name
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioTask, _EmptyTask
 
@@ -169,6 +169,22 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
     ``mark_complete_shards()`` after the pipeline has finished.  If the marker
     exists the shard is skipped entirely (resume behaviour).
 
+    Per-row enrichment
+    ------------------
+    In addition to reading and sharding, this stage also writes the
+    fields that the LLM translation stage consumes (formerly produced by
+    the now-deleted ``LanguageResolverStage``):
+
+    - ``source_lang_name``: display name of the source language
+      (e.g. ``"German"``), resolved from ``source_lang`` via ``LANGUAGE_MAP``.
+    - ``translate_to``:     list of target display names per the direction
+      rules below.
+
+    Direction rules (``T`` = normalized set of ``target_lang_codes``):
+        * ``source_lang == "en"``           -> translate_to = T \\ {"en"}  (En->X)
+        * ``source_lang in T \\ {"en"}``     -> translate_to = ["English"] (X->En)
+        * otherwise                          -> translate_to = []          (skipped)
+
     Each emitted ``AudioTask`` carries the following ``_metadata`` keys:
 
     - ``shard_id``:          ``"{manifest_stem}_{shard_idx}"``
@@ -182,28 +198,34 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
                              fully written and can be renamed to ``.jsonl.done``.
 
     Args:
-        manifest_paths:    One or more JSONL manifest paths (local or cloud).
-        output_dir:        Output directory passed to ``DirectionalShardedWriterStage``;
-                           used to locate shard completion markers.
-        target_lang_codes: ISO 639-1 codes of all target languages.  Used both
-                           to compute per-direction expected counts and to drive
-                           ``LanguageResolverStage`` downstream.
-        source_lang_key:   Row key holding the source-language ISO code
-                           (default: ``"source_lang"``).  Must match the key
-                           used by ``LanguageResolverStage``.
-        shard_size:        Number of lines per shard (default: 1 000).
+        manifest_paths:       One or more JSONL manifest paths (local or cloud).
+        output_dir:           Output directory passed to ``DirectionalShardedWriterStage``;
+                              used to locate shard completion markers.
+        target_lang_codes:    ISO 639-1 codes of all target languages.  Used to
+                              compute per-direction expected counts and to
+                              populate per-row ``translate_to``.
+        source_lang_key:      Row key holding the source-language ISO code
+                              (default: ``"source_lang"``).
+        source_lang_name_key: Row key to write the resolved source display name
+                              into (default: ``"source_lang_name"``).
+        translate_to_key:     Row key to write the per-row list of target display
+                              names into (default: ``"translate_to"``).
+        shard_size:           Number of lines per shard (default: 1 000).
     """
 
     manifest_paths: list[str] = field(default_factory=list)
     output_dir: str = ""
     target_lang_codes: list[str] = field(default_factory=list)
     source_lang_key: str = "source_lang"
+    source_lang_name_key: str = "source_lang_name"
+    translate_to_key: str = "translate_to"
     shard_size: int = 1000
     name: str = "ShardedManifestReader"
 
     _target_codes_norm: list[str] = field(default_factory=list, init=False, repr=False)
     _target_set: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
     _en_to_x_codes: list[str] = field(default_factory=list, init=False, repr=False)
+    _en_to_x_names: list[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.manifest_paths:
@@ -219,20 +241,32 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
         self._target_codes_norm = [_normalize_code(c) for c in self.target_lang_codes]
         self._target_set = frozenset(self._target_codes_norm)
         self._en_to_x_codes = [c for c in self._target_codes_norm if c != "en"]
+        # Display-name version of _en_to_x_codes, used to populate translate_to
+        # for English source rows.  Fails loudly if a configured target code is
+        # not in LANGUAGE_MAP.
+        self._en_to_x_names = [LANGUAGE_MAP[c] for c in self._en_to_x_codes]
 
     def _row_targets(self, src_norm: str) -> list[str]:
-        """Mirror LanguageResolverStage's direction rules to enumerate per-row targets."""
+        """Direction rules: enumerate per-row target ISO codes."""
         if src_norm == "en":
             return list(self._en_to_x_codes)
         if src_norm and src_norm in self._target_set:
             return ["en"]
         return []
 
+    def _row_target_names(self, src_norm: str) -> list[str]:
+        """Direction rules: enumerate per-row target display names."""
+        if src_norm == "en":
+            return list(self._en_to_x_names)
+        if src_norm and src_norm in self._target_set:
+            return [LANGUAGE_MAP["en"]]
+        return []
+
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], []
+        return [], [self.source_lang_name_key, self.translate_to_key]
 
     def process(self, task: _EmptyTask) -> list[AudioTask]:  # type: ignore[override]
         results: list[AudioTask] = []
@@ -296,13 +330,20 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
                 rows.append(json.loads(raw_line.strip()))
                 line_no += 1
 
-        # Compute per-direction expected row counts for this shard.  Mirrors
-        # LanguageResolverStage direction rules so the writer knows exactly when
-        # each (shard, direction) is complete.
+        # Single pass over rows: enrich with source_lang_name + translate_to
+        # (formerly done by LanguageResolverStage) and accumulate the
+        # per-direction expected row counts the writer relies on.
         direction_counts: dict[str, int] = {}
         for row in rows:
             src_raw = row.get(self.source_lang_key, "")
             src_norm = _normalize_code(src_raw) if src_raw else ""
+
+            # Per-row enrichment.  source_lang_name is only set when the source
+            # is non-empty so empty rows do not silently get a wrong name.
+            if src_raw:
+                row[self.source_lang_name_key] = lang_code_to_name(src_raw)
+            row[self.translate_to_key] = self._row_target_names(src_norm)
+
             for tgt_norm in self._row_targets(src_norm):
                 key = f"{src_norm}-{tgt_norm}"
                 direction_counts[key] = direction_counts.get(key, 0) + 1

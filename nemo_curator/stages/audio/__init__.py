@@ -49,7 +49,6 @@ from nemo_curator.stages.audio.segmentation import (
 )
 from nemo_curator.stages.audio.translation import (
     DirectionalShardedWriterStage,
-    LanguageResolverStage,
     LLMTranslationStage,
     ShardedManifestReaderStage,
     TranslationExpanderStage,
@@ -68,7 +67,6 @@ __all__ = [
     "DirectionalShardedWriterStage",
     "GetAudioDurationStage",
     "LLMTranslationStage",
-    "LanguageResolverStage",
     "ManifestReader",
     "ManifestWriterStage",
     "MonoConversionStage",
