@@ -121,10 +121,17 @@ def reconcile_manifests(output_dir: str) -> None:
             out_path,
         )
 
-        with open(out_path, "w", encoding="utf-8") as out_fh:
-            for _shard_idx, shard_path in shard_entries:
-                with open(shard_path, encoding="utf-8") as in_fh:
-                    shutil.copyfileobj(in_fh, out_fh)
+        tmp_path = out_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as out_fh:
+                for _shard_idx, shard_path in shard_entries:
+                    with open(shard_path, encoding="utf-8") as in_fh:
+                        shutil.copyfileobj(in_fh, out_fh)
+            os.replace(tmp_path, out_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
         n_written += 1
 

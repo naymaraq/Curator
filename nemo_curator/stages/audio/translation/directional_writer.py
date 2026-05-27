@@ -93,6 +93,7 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     _shards_dir: str = field(default="", init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _n_skipped_done: int = field(default=0, init=False, repr=False)
+    _n_shard_markers_written: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.output_dir:
@@ -146,16 +147,19 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
                 try:
                     with open(marker, "w") as _f:
                         pass
+                    self._n_shard_markers_written += 1
                     logger.info("DirectionalShardedWriter: shard marker written → {}", marker)
                 except OSError as exc:
                     logger.warning("DirectionalShardedWriter: could not write shard marker {}: {}", marker, exc)
 
         logger.info(
             "DirectionalShardedWriter: teardown — {}/{} shard-direction file(s) marked .done, "
-            "{} shard marker(s) written, {} rows written, {} rows skipped (already done)",
+            "{} shard marker(s) newly written ({} already existed), "
+            "{} rows written, {} rows skipped (already done)",
             len(renamed),
             len(handle_keys),
-            len(self._seen_shard_ids),
+            self._n_shard_markers_written,
+            len(self._seen_shard_ids) - self._n_shard_markers_written,
             self._n_written,
             self._n_skipped_done,
         )

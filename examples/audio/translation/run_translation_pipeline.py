@@ -79,9 +79,9 @@ from nemo_curator.stages.audio import (
     LLMTranslationStage,
     ShardedManifestReaderStage,
     TranslationExpanderStage,
+    all_shards_done,
     reconcile_manifests,
 )
-from nemo_curator.stages.audio.translation.sharded_manifest_reader import all_shards_done
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

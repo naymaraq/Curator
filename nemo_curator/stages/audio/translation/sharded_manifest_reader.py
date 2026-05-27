@@ -15,9 +15,10 @@
 """Sharded manifest reader with resume support for the translation pipeline.
 
 Each input manifest is split into virtual chunks of ``shard_size`` lines.
-A shard is considered *done* when all per-direction ``.done`` files produced
-by ``DirectionalShardedWriterStage`` exist for it.  Done shards are skipped
-on subsequent pipeline calls, enabling cheap resume after failures.
+A shard is considered *done* when a single ``{shard_id}.shard.done`` marker
+file (written by ``DirectionalShardedWriterStage.teardown()``) exists in
+``{output_dir}/shards/``.  Done shards are skipped on subsequent pipeline
+calls, enabling cheap resume after failures.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ from fsspec.core import url_to_fs
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.audio.translation.language_resolver import _normalize_code
 from nemo_curator.tasks import AudioTask, _EmptyTask
 
 
@@ -41,7 +41,7 @@ def shard_done_marker_path(output_dir: str, shard_id: str) -> str:
     return os.path.join(output_dir, "shards", f"{shard_id}.shard.done")
 
 
-def _shard_is_done(output_dir: str, shard_id: str, _directions: object = None) -> bool:
+def _shard_is_done(output_dir: str, shard_id: str) -> bool:
     """Return True if the shard-level completion marker exists for this shard."""
     return os.path.exists(shard_done_marker_path(output_dir, shard_id))
 
@@ -101,9 +101,9 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
     """Read JSONL manifests in shards; skip already-completed shards.
 
     Splits every input manifest into virtual chunks of ``shard_size`` lines.
-    For each shard, checks whether ``DirectionalShardedWriterStage`` has
-    already produced ``.done`` files for every expected direction; if so,
-    the shard is skipped entirely (resume behaviour).
+    For each shard, checks for a ``{shard_id}.shard.done`` marker written by
+    ``DirectionalShardedWriterStage.teardown()``.  If the marker exists the
+    shard is skipped entirely (resume behaviour).
 
     Each emitted ``AudioTask`` carries the following ``_metadata`` keys:
 

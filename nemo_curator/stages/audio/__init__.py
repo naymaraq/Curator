@@ -53,8 +53,10 @@ from nemo_curator.stages.audio.translation import (
     LLMTranslationStage,
     ShardedManifestReaderStage,
     TranslationExpanderStage,
+    all_shards_done,
     list_pending_shards,
     reconcile_manifests,
+    shard_done_marker_path,
 )
 
 __all__ = [
@@ -78,6 +80,8 @@ __all__ = [
     "TranslationExpanderStage",
     "UTMOSFilterStage",
     "VADSegmentationStage",
+    "all_shards_done",
     "list_pending_shards",
     "reconcile_manifests",
+    "shard_done_marker_path",
 ]
