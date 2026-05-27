@@ -14,21 +14,51 @@
 
 """LLM-based translation pipeline (text-only, vLLM).
 
-Reads a JSONL manifest of ``text`` + ``source_lang`` (code) entries and
-produces ``data["translations"]`` keyed by target language display name.
-Direction is restricted to ``En->X`` and ``X->En``, where ``X`` ranges
-over the codes passed via ``--target_langs``.
+Architecture
+------------
+::
 
-Architecture:
-    ManifestReader (CPU)
-        -> reads JSONL manifest(s), emits one Task per line
-    LanguageResolverStage (CPU)
-        -> resolves source_lang code -> source_lang_name (display name)
-           and writes per-row translate_to list (En->X / X->En only)
-    LLMTranslationStage (GPU)
-        -> batched vLLM inference, writes data["translations"][lang_name]
-    ManifestWriterStage (CPU)
-        -> appends each translated entry to a single JSONL output
+    ShardedManifestReaderStage   (CPU, _EmptyTask → AudioTask)
+        Reads one or more JSONL manifests in shards; skips shards that are
+        already complete from a prior run (.done markers).
+
+    LanguageResolverStage        (CPU, AudioTask → AudioTask)
+        Resolves source_lang code → display name; writes per-row
+        translate_to list (En→X / X→En only).
+
+    LLMTranslationStage          (GPU, AudioTask → AudioTask)
+        Batched vLLM inference; writes data["translations"]
+        as {display_name: translated_text}.
+
+    TranslationExpanderStage     (CPU, AudioTask → list[AudioTask])
+        Fan-out: one task per direction with flat schema
+        {text, source_lang, target_lang (ISO), translation}.
+
+    DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
+        Writes tasks to {output_dir}/shards/{shard_id}_{src}-{tgt}.jsonl;
+        renames to .done when the shard is complete.
+
+After the pipeline, ``reconcile_manifests`` merges completed shards into::
+
+    {output_dir}/{manifest_stem}_{src}-{tgt}.jsonl
+
+e.g. ``m1_en-de.jsonl``, ``m1_en-fr.jsonl``, ``m2_en-de.jsonl``, …
+
+Resume behaviour
+----------------
+Re-running with the same ``--output_dir`` automatically skips shards whose
+``.done`` files are present.  Only failed or partial shards are re-processed.
+
+Example
+-------
+::
+
+    python run_translation_pipeline.py \\
+        --manifest m1.jsonl m2.jsonl \\
+        --output_dir /data/translations \\
+        --target_langs de fr ru ja \\
+        --model_id Qwen/Qwen3-8B \\
+        --shard_size 500
 """
 
 import os
@@ -44,142 +74,125 @@ from loguru import logger
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio import (
+    DirectionalShardedWriterStage,
     LanguageResolverStage,
     LLMTranslationStage,
-    ManifestReader,
-    ManifestWriterStage,
+    ShardedManifestReaderStage,
+    TranslationExpanderStage,
+    reconcile_manifests,
 )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="LLM translation pipeline (text-only, vLLM).")
+
+    # ------------------------------------------------------------------ I/O
     ap.add_argument(
         "--manifest",
         type=str,
         required=True,
-        help="Input JSONL manifest path (file or directory). Multiple paths can be passed space-separated.",
         nargs="+",
+        help="Input JSONL manifest path(s). Multiple paths can be passed space-separated.",
     )
     ap.add_argument(
-        "--output_manifest", 
-        type=str, 
-        required=True, 
-        help="Output JSONL manifest path."
-    )
-    ap.add_argument(
-        "--model_id", 
-        type=str, 
-        default="Qwen/Qwen3.5-35B-A3B-FP8", 
-        help="Translation LLM model id."
-    )
-    translation_prompt_group = ap.add_mutually_exclusive_group()
-    translation_prompt_group.add_argument(
-        "--translation_prompt",
+        "--output_dir",
         type=str,
-        default=None,
-        help="Optional inline translation prompt template. Mutually exclusive with --translation_prompt_file.",
-    )
-    translation_prompt_group.add_argument(
-        "--translation_prompt_file",
-        type=str,
-        default=None,
+        required=True,
         help=(
-            "Path to translation prompt template. Falls back to the stage's bundled default if unset. "
-            "Mutually exclusive with --translation_prompt."
+            "Output directory. Shard files land in {output_dir}/shards/; "
+            "reconciled per-manifest per-direction files land directly in {output_dir}/."
         ),
     )
-    system_prompt_group = ap.add_mutually_exclusive_group()
-    system_prompt_group.add_argument(
-        "--system_prompt",
-        type=str,
-        default=None,
-        help="Optional inline system prompt string. Mutually exclusive with --system_prompt_file.",
-    )
-    system_prompt_group.add_argument(
-        "--system_prompt_file",
-        type=str,
-        default=None,
-        help="Optional path to a system prompt file. Mutually exclusive with --system_prompt.",
+    ap.add_argument(
+        "--shard_size",
+        type=int,
+        default=1000,
+        help="Lines per shard (default: 1000). Smaller shards = finer resume granularity.",
     )
 
-    ap.add_argument(
-        "--text_key", 
-        type=str, 
-        default="text", 
-        help="Manifest key holding the source text."
-    )
+    # ------------------------------------------------------------------ Languages
     ap.add_argument(
         "--target_langs",
         type=str,
         nargs="+",
         required=True,
         help=(
-            "Target language codes (e.g. 'en sv fr'). LanguageResolverStage resolves them "
-            "to display names and writes per-row translate_to lists, restricted to En->X "
-            "and X->En pairs."
+            "Target language ISO codes (e.g. 'de fr ru ja'). "
+            "LanguageResolverStage generates En→X and X→En pairs."
         ),
     )
     ap.add_argument(
         "--source_lang_code_key",
         type=str,
         default="source_lang",
-        help=(
-            "Input manifest key holding the source language CODE. The resolver reads this "
-            "and writes the resolved display name to --source_lang_key."
-        ),
+        help="Input manifest key holding the source language ISO code.",
     )
     ap.add_argument(
-        "--source_lang_key",
+        "--source_lang_name_key",
         type=str,
         default="source_lang_name",
-        help=(
-            "Manifest key holding the source language DISPLAY NAME (resolver output, "
-            "translator input)."
-        ),
+        help="Intermediate key for resolved source language display name.",
     )
     ap.add_argument(
         "--target_lang_key",
         type=str,
         default="translate_to",
-        help=(
-            "Manifest key holding the per-row list of target language display names "
-            "(resolver output, translator input)."
-        ),
+        help="Intermediate key for per-row list of target language display names.",
     )
+
+    # ------------------------------------------------------------------ Model
+    ap.add_argument(
+        "--model_id",
+        type=str,
+        default="Qwen/Qwen3.5-35B-A3B-FP8",
+        help="Translation LLM model ID.",
+    )
+
+    # Prompt overrides (mutually exclusive pairs)
+    tpg = ap.add_mutually_exclusive_group()
+    tpg.add_argument("--translation_prompt", type=str, default=None)
+    tpg.add_argument("--translation_prompt_file", type=str, default=None)
+
+    spg = ap.add_mutually_exclusive_group()
+    spg.add_argument("--system_prompt", type=str, default=None)
+    spg.add_argument("--system_prompt_file", type=str, default=None)
+
+    ap.add_argument("--text_key", type=str, default="text", help="Manifest key for source text.")
     ap.add_argument(
         "--translations_key",
         type=str,
         default="translations",
-        help="Output manifest key under which the {target_lang: translation} dict is stored.",
+        help="Intermediate key for the {lang_name: text} dict produced by LLMTranslationStage.",
     )
 
-    ap.add_argument("--tensor_parallel_size", type=int, default=None, help="GPUs for tensor parallelism (auto if unset).")
+    # vLLM params
+    ap.add_argument("--tensor_parallel_size", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_output_tokens", type=int, default=1024)
     ap.add_argument("--max_model_len", type=int, default=4096)
     ap.add_argument("--max_num_seqs", type=int, default=16)
-    ap.add_argument(
-        "--max_num_batched_tokens",
-        type=int,
-        default=None,
-        help="vLLM max batched tokens per step. Defaults to max(max_model_len, 8192).",
-    )
+    ap.add_argument("--max_num_batched_tokens", type=int, default=None)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
-    ap.add_argument("--kv_cache_dtype", type=str, default="fp8", help="KV-cache dtype passed to vLLM.")
+    ap.add_argument("--kv_cache_dtype", type=str, default="fp8")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.8)
     ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--min_p", type=float, default=0.0)
     ap.add_argument("--presence_penalty", type=float, default=1.5)
     ap.add_argument("--repetition_penalty", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=1234, help="Seed for vLLM and sampling params.")
+    ap.add_argument("--seed", type=int, default=1234)
 
+    # ------------------------------------------------------------------ Executor
     ap.add_argument(
         "--execution_mode",
         type=str,
         default="streaming",
         choices=["streaming", "batch"],
-        help="Xenna execution mode.",
+    )
+    ap.add_argument(
+        "--skip_reconcile",
+        action="store_true",
+        help="Skip the reconciliation step (useful when re-running only the main pipeline).",
     )
     return ap
 
@@ -188,11 +201,16 @@ def main() -> None:
     args = _build_arg_parser().parse_args()
 
     stages = [
-        ManifestReader(manifest_path=args.manifest),
+        ShardedManifestReaderStage(
+            manifest_paths=args.manifest,
+            output_dir=args.output_dir,
+            target_lang_codes=args.target_langs,
+            shard_size=args.shard_size,
+        ),
         LanguageResolverStage(
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
-            source_lang_name_key=args.source_lang_key,
+            source_lang_name_key=args.source_lang_name_key,
             translate_to_key=args.target_lang_key,
         ),
         LLMTranslationStage(
@@ -202,7 +220,7 @@ def main() -> None:
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
             text_key=args.text_key,
-            source_lang_key=args.source_lang_key,
+            source_lang_key=args.source_lang_name_key,
             target_lang_key=args.target_lang_key,
             translations_key=args.translations_key,
             tensor_parallel_size=args.tensor_parallel_size,
@@ -221,20 +239,38 @@ def main() -> None:
             seed=args.seed,
             batch_size=args.batch_size,
         ),
-        ManifestWriterStage(output_path=args.output_manifest),
+        TranslationExpanderStage(
+            source_lang_key=args.source_lang_code_key,
+            translations_key=args.translations_key,
+        ),
+        DirectionalShardedWriterStage(
+            output_dir=args.output_dir,
+            source_lang_key="source_lang",
+            target_lang_key="target_lang",
+        ),
     ]
 
     pipeline = Pipeline(name="translation_pipeline", stages=stages)
-    logger.info(f"Pipeline: {pipeline.describe()}")
+    logger.info("Pipeline:\n{}", pipeline.describe())
 
     executor = XennaExecutor(config={"execution_mode": args.execution_mode})
 
     t0 = time.time()
     pipeline.run(executor=executor)
-    elapsed = time.time() - t0
-    logger.info(f"Pipeline finished in {elapsed / 60:.1f} min. Output: {args.output_manifest}")
+    pipeline_elapsed = time.time() - t0
+    logger.info("Pipeline finished in {:.1f} min.", pipeline_elapsed / 60)
+
+    if not args.skip_reconcile:
+        logger.info("Reconciling shards → per-manifest per-direction manifests …")
+        t1 = time.time()
+        reconcile_manifests(output_dir=args.output_dir)
+        logger.info("Reconciliation finished in {:.1f} s.", time.time() - t1)
+
+    logger.info(
+        "Done. Output files are in: {}",
+        args.output_dir,
+    )
 
 
 if __name__ == "__main__":
     main()
-

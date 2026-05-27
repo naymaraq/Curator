@@ -47,13 +47,22 @@ from nemo_curator.stages.audio.segmentation import (
     SpeakerSeparationStage,
     VADSegmentationStage,
 )
-from nemo_curator.stages.audio.translation import LanguageResolverStage, LLMTranslationStage
+from nemo_curator.stages.audio.translation import (
+    DirectionalShardedWriterStage,
+    LanguageResolverStage,
+    LLMTranslationStage,
+    ShardedManifestReaderStage,
+    TranslationExpanderStage,
+    list_pending_shards,
+    reconcile_manifests,
+)
 
 __all__ = [
     "ALMDataBuilderStage",
     "ALMDataOverlapStage",
     "AudioDataFilterStage",
     "BandFilterStage",
+    "DirectionalShardedWriterStage",
     "GetAudioDurationStage",
     "LLMTranslationStage",
     "LanguageResolverStage",
@@ -63,8 +72,12 @@ __all__ = [
     "PreserveByValueStage",
     "SIGMOSFilterStage",
     "SegmentConcatenationStage",
+    "ShardedManifestReaderStage",
     "SpeakerSeparationStage",
     "TimestampMapperStage",
+    "TranslationExpanderStage",
     "UTMOSFilterStage",
     "VADSegmentationStage",
+    "list_pending_shards",
+    "reconcile_manifests",
 ]

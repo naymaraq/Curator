@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_curator.stages.audio.translation.directional_writer import DirectionalShardedWriterStage
 from nemo_curator.stages.audio.translation.language_resolver import LanguageResolverStage
 from nemo_curator.stages.audio.translation.llm_translation import LLMTranslationStage
+from nemo_curator.stages.audio.translation.reconciler import list_pending_shards, reconcile_manifests
+from nemo_curator.stages.audio.translation.sharded_manifest_reader import ShardedManifestReaderStage
+from nemo_curator.stages.audio.translation.translation_expander import TranslationExpanderStage
 
-__all__ = ["LLMTranslationStage", "LanguageResolverStage"]
+__all__ = [
+    "DirectionalShardedWriterStage",
+    "LLMTranslationStage",
+    "LanguageResolverStage",
+    "ShardedManifestReaderStage",
+    "TranslationExpanderStage",
+    "list_pending_shards",
+    "reconcile_manifests",
+]

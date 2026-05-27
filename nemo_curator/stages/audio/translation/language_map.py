@@ -46,3 +46,22 @@ LANGUAGE_MAP: dict[str, str] = {
     "zh": "Chinese",
     "th": "Thai",
 }
+
+# Reverse map: display name → ISO 639-1 code (e.g. "German" → "de").
+# Built once at import time; raises on duplicate display names (shouldn't happen).
+NAME_TO_CODE: dict[str, str] = {name: code for code, name in LANGUAGE_MAP.items()}
+
+
+def name_to_code(display_name: str) -> str:
+    """Map a language display name to its ISO 639-1 code via ``NAME_TO_CODE``.
+
+    Raises ``KeyError`` for unknown display names so callers fail loudly
+    rather than silently emitting wrong language codes.
+    """
+    if display_name not in NAME_TO_CODE:
+        msg = (
+            f"Display name '{display_name}' not found in NAME_TO_CODE. "
+            "Add it to nemo_curator/stages/audio/translation/language_map.py."
+        )
+        raise KeyError(msg)
+    return NAME_TO_CODE[display_name]
