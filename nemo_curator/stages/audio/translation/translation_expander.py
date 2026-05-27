@@ -101,11 +101,12 @@ class TranslationExpanderStage(ProcessingStage[AudioTask, AudioTask]):
 
             if not translated_text or not translated_text.strip():
                 logger.warning(
-                    "TranslationExpander: empty translation for target '{}' in task {}; skipping",
+                    "TranslationExpander: empty translation for target '{}' in task {}; "
+                    "emitting row with empty translation to preserve row counts",
                     display_name,
                     task.task_id,
                 )
-                continue
+                translated_text = ""
 
             output_data = dict(source_data)
             output_data[self.target_lang_key] = tgt_code

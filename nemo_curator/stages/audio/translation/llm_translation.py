@@ -309,18 +309,26 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             raw_targets = data.pop(self.target_lang_key, None) or []
             source_lang = data.pop(self.source_lang_key, "")
 
-            # Skip tasks with empty text
-            text = data.get(self.text_key, "")
-            if not text or not text.strip():
-                continue
-
             # Normalize target language(s): accept str or list[str].
             if isinstance(raw_targets, str):
                 raw_targets = [raw_targets]
-            targets = list(dict.fromkeys(raw_targets)) # Remove duplicates
+            targets = list(dict.fromkeys(raw_targets))  # Remove duplicates
 
-            # Skip tasks with no targets
+            # Skip tasks with no targets (these rows are not counted by the
+            # reader either, so downstream row-count expectations stay matched).
             if not targets:
+                continue
+
+            text = data.get(self.text_key, "")
+            if not text or not text.strip():
+                # Empty text: do not run the LLM, but still populate one empty
+                # translation per target so the writer's per-direction counter
+                # matches the reader's expectation.  Without this the shard's
+                # direction file would stay open and never be renamed to .done.
+                translations = task.data.get(self.translations_key) or {}
+                for target_lang in targets:
+                    translations.setdefault(target_lang, "")
+                task.data[self.translations_key] = translations
                 continue
 
             for target_lang in targets:

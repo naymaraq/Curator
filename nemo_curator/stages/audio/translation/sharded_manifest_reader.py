@@ -16,9 +16,9 @@
 
 Each input manifest is split into virtual chunks of ``shard_size`` lines.
 A shard is considered *done* when a single ``{shard_id}.shard.done`` marker
-file (written by ``DirectionalShardedWriterStage.teardown()``) exists in
-``{output_dir}/shards/``.  Done shards are skipped on subsequent pipeline
-calls, enabling cheap resume after failures.
+file (written by ``mark_complete_shards()`` after ``pipeline.run()`` returns)
+exists in ``{output_dir}/shards/``.  Done shards are skipped on subsequent
+pipeline calls, enabling cheap resume after failures.
 """
 
 from __future__ import annotations
@@ -166,8 +166,8 @@ class ShardedManifestReaderStage(ProcessingStage[_EmptyTask, AudioTask]):
 
     Splits every input manifest into virtual chunks of ``shard_size`` lines.
     For each shard, checks for a ``{shard_id}.shard.done`` marker written by
-    ``DirectionalShardedWriterStage.teardown()``.  If the marker exists the
-    shard is skipped entirely (resume behaviour).
+    ``mark_complete_shards()`` after the pipeline has finished.  If the marker
+    exists the shard is skipped entirely (resume behaviour).
 
     Each emitted ``AudioTask`` carries the following ``_metadata`` keys:
 
