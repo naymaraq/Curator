@@ -50,13 +50,10 @@ from nemo_curator.stages.audio.segmentation import (
 from nemo_curator.stages.audio.translation import (
     DirectionalShardedWriterStage,
     LLMTranslationStage,
-    ShardedManifestReaderStage,
     TranslationExpanderStage,
+    TranslationManifestReader,
+    TranslationManifestReaderStage,
     all_shards_done,
-    list_pending_shards,
-    mark_complete_shards,
-    reconcile_manifests,
-    shard_done_marker_path,
 )
 
 __all__ = [
@@ -73,15 +70,12 @@ __all__ = [
     "PreserveByValueStage",
     "SIGMOSFilterStage",
     "SegmentConcatenationStage",
-    "ShardedManifestReaderStage",
     "SpeakerSeparationStage",
     "TimestampMapperStage",
     "TranslationExpanderStage",
+    "TranslationManifestReader",
+    "TranslationManifestReaderStage",
     "UTMOSFilterStage",
     "VADSegmentationStage",
     "all_shards_done",
-    "list_pending_shards",
-    "mark_complete_shards",
-    "reconcile_manifests",
-    "shard_done_marker_path",
 ]

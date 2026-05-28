@@ -45,7 +45,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
 
     Reads source text plus pre-resolved language **display names** from each
     ``AudioTask.data`` dict (``source_lang_key`` and ``target_lang_key``;
-    populated upstream by ``ShardedManifestReaderStage``) and writes the
+    populated upstream by ``TranslationManifestReaderStage``) and writes the
     result into ``data[translations_key]`` as a ``{display_name: translation}``
     mapping, so multiple target languages accumulate without overwriting
     prior entries. The scratch fields ``source_lang_key`` and
@@ -303,7 +303,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
         for task_idx, task in enumerate(tasks):
             data = task.data
 
-            # Pop scratch fields written by ShardedManifestReaderStage
+            # Pop scratch fields written by TranslationManifestReaderStage
             # up-front so they never reach the output manifest, regardless of
             # which skip branch (if any) the task hits below.
             raw_targets = data.pop(self.target_lang_key, None) or []

@@ -18,34 +18,46 @@ Architecture
 ------------
 ::
 
-    ShardedManifestReaderStage   (CPU, _EmptyTask → AudioTask)
-        Reads one or more JSONL manifests in shards; skips shards that are
-        already complete from a prior run (.done markers).  Also resolves
-        source_lang ISO code → display name and writes the per-row
-        translate_to list (En→X / X→En only).
+    TranslationManifestReader     (CPU, _EmptyTask → AudioTask)
+        Composite stage = FilePartitioningStage + per-file reader.
+        One input manifest == one shard.  For each row it resolves the
+        source_lang ISO code → display name, writes the per-row
+        translate_to list (En→X / X→En), and tags the AudioTask with
+        _metadata = {_shard_key, _shard_total, direction_counts}.
+        On resume, shards whose every expected direction is already
+        .done are skipped; partial .jsonl files are deleted so the
+        writer's append mode starts clean.
 
-    LLMTranslationStage          (GPU, AudioTask → AudioTask)
+    LLMTranslationStage           (GPU, AudioTask → AudioTask)
         Batched vLLM inference; writes data["translations"]
         as {display_name: translated_text}.
 
-    TranslationExpanderStage     (CPU, AudioTask → list[AudioTask])
+    TranslationExpanderStage      (CPU, AudioTask → list[AudioTask])
         Fan-out: one task per direction with flat schema
         {text, source_lang, target_lang (ISO), translation}.
 
     DirectionalShardedWriterStage (CPU, AudioTask → AudioTask)
-        Writes tasks to {output_dir}/shards/{shard_id}_{src}-{tgt}.jsonl;
-        renames to .done when the shard is complete.
+        Open-append-close per row to
+        {output_dir}/{shard_key}_{src}-{tgt}.jsonl; renames to .done
+        inline once the per-direction counter equals direction_counts
+        for that direction.  setup() recovers counters from disk so
+        actor restarts pick up where they left off.
 
-After the pipeline, ``reconcile_manifests`` merges completed shards into::
+Final outputs land directly at::
 
-    {output_dir}/{manifest_stem}_{src}-{tgt}.jsonl
+    {output_dir}/{manifest_stem}_{src}-{tgt}.jsonl.done
 
-e.g. ``m1_en-de.jsonl``, ``m1_en-fr.jsonl``, ``m2_en-de.jsonl``, …
+e.g. ``m1_en-de.jsonl.done``, ``m1_en-fr.jsonl.done``,
+``m2_en-de.jsonl.done``, …
+
+There is no ``shards/`` subdir and no separate reconciliation step — the
+writer's per-direction file *is* the final output.
 
 Resume behaviour
 ----------------
-Re-running with the same ``--output_dir`` automatically skips shards whose
-``.done`` files are present.  Only failed or partial shards are re-processed.
+Re-running with the same ``--output_dir`` skips any shard whose expected
+direction ``.done`` files are all present.  Only failed or partial shards
+are re-processed.
 
 Example
 -------
@@ -55,8 +67,7 @@ Example
         --manifest m1.jsonl m2.jsonl \\
         --output_dir /data/translations \\
         --target_langs de fr ru ja \\
-        --model_id Qwen/Qwen3-8B \\
-        --shard_size 500
+        --model_id Qwen/Qwen3-8B
 """
 
 import os
@@ -74,11 +85,9 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio import (
     DirectionalShardedWriterStage,
     LLMTranslationStage,
-    ShardedManifestReaderStage,
     TranslationExpanderStage,
+    TranslationManifestReader,
     all_shards_done,
-    mark_complete_shards,
-    reconcile_manifests,
 )
 
 
@@ -91,22 +100,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         required=True,
         nargs="+",
-        help="Input JSONL manifest path(s). Multiple paths can be passed space-separated.",
+        help=(
+            "Input JSONL manifest path(s). Accepts individual files, directories, "
+            "or glob patterns (FilePartitioningStage handles discovery). One file == one shard."
+        ),
     )
     ap.add_argument(
         "--output_dir",
         type=str,
         required=True,
         help=(
-            "Output directory. Shard files land in {output_dir}/shards/; "
-            "reconciled per-manifest per-direction files land directly in {output_dir}/."
+            "Output directory. Final per-(manifest, direction) files land directly here as "
+            "{stem}_{src}-{tgt}.jsonl.done — no shards/ subdir, no reconciliation step."
         ),
-    )
-    ap.add_argument(
-        "--shard_size",
-        type=int,
-        default=1000,
-        help="Lines per shard (default: 1000). Smaller shards = finer resume granularity.",
     )
 
     # ------------------------------------------------------------------ Languages
@@ -117,7 +123,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Target language ISO codes (e.g. 'de fr ru ja'). "
-            "ShardedManifestReaderStage generates En→X and X→En pairs."
+            "TranslationManifestReader generates En→X and X→En pairs."
         ),
     )
     ap.add_argument(
@@ -195,14 +201,13 @@ def main() -> None:
     args = _build_arg_parser().parse_args()
 
     stages = [
-        ShardedManifestReaderStage(
-            manifest_paths=args.manifest,
+        TranslationManifestReader(
+            manifest_path=args.manifest,
             output_dir=args.output_dir,
             target_lang_codes=args.target_langs,
             source_lang_key=args.source_lang_code_key,
             source_lang_name_key=args.source_lang_name_key,
             translate_to_key=args.target_lang_key,
-            shard_size=args.shard_size,
         ),
         LLMTranslationStage(
             model_id=args.model_id,
@@ -245,30 +250,15 @@ def main() -> None:
     logger.info("Pipeline:\n{}", pipeline.describe())
 
     t0 = time.time()
-    if all_shards_done(
-        manifest_paths=args.manifest,
-        output_dir=args.output_dir,
-        target_lang_codes=args.target_langs,
-        shard_size=args.shard_size,
-    ):
+    if all_shards_done(manifest_path=args.manifest, output_dir=args.output_dir):
         logger.info("All shards are already complete — skipping pipeline.run().")
     else:
         executor = XennaExecutor(config={"execution_mode": args.execution_mode})
         pipeline.run(executor=executor)
         logger.info("Pipeline finished in {:.1f} min.", (time.time() - t0) / 60)
 
-        # Write .shard.done markers for every fully-written shard.  Xenna does
-        # not call teardown() on our stages, so this must be done here.
-        n_marked = mark_complete_shards(output_dir=args.output_dir)
-        logger.info("mark_complete_shards: {} new shard marker(s) written.", n_marked)
-
-    logger.info("Reconciling shards → per-manifest per-direction manifests …")
-    t1 = time.time()
-    reconcile_manifests(output_dir=args.output_dir)
-    logger.info("Reconciliation finished in {:.1f} s.", time.time() - t1)
-
     logger.info(
-        "Done. Output files are in: {}",
+        "Done. Output files (*.jsonl.done) are in: {}",
         args.output_dir,
     )
 
